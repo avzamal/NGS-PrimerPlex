@@ -1,4 +1,4 @@
-# NGS-PrimerPlex is a high-throughput tool for mupltiplex primer design
+# NGS-PrimerPlex is a high-throughput tool for multiplex primer design
 It includes four Python-scripts:
 * **getGeneRegions.py** - script that converts list of genes and their parts into genome coordinates for which the next script designs primers.
 * **NGS_primerplex.py** - script that designs primers for the user defined genome coordinates.
