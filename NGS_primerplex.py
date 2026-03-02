@@ -11,6 +11,11 @@ import primer3
 import logging
 import pysam
 import xlrd
+# Fix xlrd 1.2.0 compatibility with Python 3.12+ (getiterator removed from ElementTree)
+# defusedxml.cElementTree lacks ElementTree class, so xlrd wrongly sets Element_has_iter=False
+import xlrd.xlsx as _xlrd_xlsx
+_xlrd_xlsx.ensure_elementtree_imported(0, None)
+_xlrd_xlsx.Element_has_iter = True
 import numpy
 import statistics as stat
 from copy import deepcopy
@@ -48,6 +53,7 @@ def readInputFile(regionsFile):
     regionsCoords={}
     regionNameToMultiplex={}
     regionNameToPrimerType={}
+    regionNameToPriority={}
     uniquePointRegions=0
     totalPointInputRegions=0
     for string in regionsFile:
@@ -124,6 +130,18 @@ def readInputFile(regionsFile):
                             endShift=0
                     else:
                         endShift=0
+                    # Parse optional priority column (8th column, values 1-3, default 1)
+                    if len(cols)>7 and cols[7].strip()!='':
+                        try:
+                            priority=int(cols[7].strip())
+                            if priority not in [1,2,3]:
+                                print('WARNING! Priority value should be 1, 2, or 3. Got:',priority,'. Using default 1.')
+                                priority=1
+                        except ValueError:
+                            priority=1
+                    else:
+                        priority=1
+                    regionNameToPriority[curRegionName]=priority
                     if chrom not in allRegions.keys():
                         if endShift>0:
                             allRegions[chrom]={curRegionName:[chrom,regStart,regStart+endShift,curRegionName]}
@@ -166,7 +184,7 @@ def readInputFile(regionsFile):
     # allRegions has chromosome names
     # regionsCoords has chromosome numbers
     # regionNameToChrom has chromosome names
-    return(allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType)
+    return(allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType,regionNameToPriority)
 
 def readPrimersFile(primersFile):
     wb=xlrd.open_workbook(primersFile)
@@ -2147,7 +2165,7 @@ def joinAmpliconsToBlocks(poolArgs):
                 if not mayFormDimer:
                     # Calculate weight of this edge - distance between amplicons
                     weight=maxAmplLen-min(50,primers2[0][0]-primers1[1][0]) # if distance is too large (>50), leave it as 50
-                    blockGraph.add_edge(primerPairName1,primerPairName2,attr_dict={'weight':weight})
+                    blockGraph.add_edge(primerPairName1,primerPairName2,weight=weight)
                     nextMutNotCovered=False
             elif (not firstMut and
                   amplBlockStart2<=prevMut<=amplBlockEnd2 and
@@ -2155,7 +2173,7 @@ def joinAmpliconsToBlocks(poolArgs):
                 if not mayFormDimer:
                     # Calculate weight of this edge - distance between amplicons
                     weight=maxAmplLen-min(50,primers1[0][0]-primers2[1][0]) # if distance is too large (>50), leave it as 50
-                    blockGraph.add_edge(primerPairName1,primerPairName2,attr_dict={'weight':weight})
+                    blockGraph.add_edge(primerPairName1,primerPairName2,weight=weight)
                     prevMutNotCovered=False
     blocksFinalShortestPaths=[]
     leftGoodPrimers=[]
@@ -2551,7 +2569,7 @@ def makeFinalMultiplexes(initialGraph,multiplexes=[],
         if len(initialGraph)==0:
             return(multiplexes)
         elif len(initialGraph.nodes())==1:
-            return(multiplexes+[initialGraph.nodes()])
+            return(multiplexes+[list(initialGraph.nodes())])
         elif (len(initialGraph.nodes())==currentMultNum and
               len(multiplexes)==0):
             return([[x] for x in initialGraph.nodes()])
@@ -2606,7 +2624,7 @@ def makeFinalMultiplexes(initialGraph,multiplexes=[],
         # Go through all unsorted nodes
         for leftUnsortedNode in graph.nodes():
             multNumsToWhichWeTried=[]
-            neighbours=initialGraph.neighbors(leftUnsortedNode)
+            neighbours=set(initialGraph.neighbors(leftUnsortedNode))
             # Go through all multiplexes and try to add the unsorted node to this multiplex
             while(len(multNumsToWhichWeTried)<currentMultNum):
                 thisAmpliconFitsThisMultiplex=True
@@ -2667,7 +2685,7 @@ def sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,ar
                 print('Try to change multiplex numbers in the input file.')
                 logger.warn('Try to change multiplex numbers in the input file.')
             else:
-                leftUnsortedAmpls=leftNodesGraph.nodes()
+                leftUnsortedAmpls=list(leftNodesGraph.nodes())
                 print('NGS_primerplex will try to add them to the next group of multiplexes.')
                 logger.warn('NGS_primerplex will try to add them to the next group of multiplexes.')
         else:
@@ -2684,11 +2702,279 @@ def sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,ar
             exit(27)
     return(multiplexes)
 
+def identifyProblematicPrimers(globalMultiplexNums,amplNameToPriority,outputInternalPrimers):
+    """
+    Identify primers that are incompatible with many others (low degree in compatibility graph).
+    These are candidates for re-design in smart re-selection mode.
+    Returns list of (amplicon_name, degree, priority, incompatible_count) sorted by impact.
+    """
+    if len(globalMultiplexNums) == 0:
+        return []
+
+    degrees = dict(globalMultiplexNums.degree())
+    if not degrees:
+        return []
+
+    total_nodes = len(degrees)
+    avg_degree = sum(degrees.values()) / total_nodes if total_nodes > 0 else 0
+
+    # Find primers with degree below 30% of average (many incompatibilities)
+    threshold = avg_degree * 0.3
+    problematic = []
+    for node, degree in degrees.items():
+        if degree < threshold:
+            priority = amplNameToPriority.get(node, 1)
+            incompatible = total_nodes - 1 - degree  # number of incompatible pairs
+            problematic.append((node, degree, priority, incompatible))
+
+    # Sort: highest-priority primers with most incompatibilities first
+    problematic.sort(key=lambda x: (x[2], -x[3]))
+    return problematic
+
+
+def smartReselection(globalMultiplexNums, amplNameToPriority, outputInternalPrimers,
+                     allPrimersInfo, primersToAmplNames, checkPrimersFitFunc,
+                     args, unspecificPrimers):
+    """
+    Smart primer re-selection: for problematic primers (low compatibility),
+    try alternative primer pairs for the same region that have better compatibility.
+
+    Returns the number of replacements made.
+    """
+    problematic = identifyProblematicPrimers(globalMultiplexNums, amplNameToPriority, outputInternalPrimers)
+    if not problematic:
+        print(' # Smart re-selection: no problematic primers found.')
+        logger.info(' # Smart re-selection: no problematic primers found.')
+        return 0
+
+    print(f' # Smart re-selection: found {len(problematic)} problematic primers (low compatibility):')
+    logger.info(f' # Smart re-selection: found {len(problematic)} problematic primers (low compatibility):')
+    for name, degree, pri, incompat in problematic:
+        print(f'   {name}: degree={degree}, priority={pri}, incompatible_with={incompat}')
+        logger.info(f'   {name}: degree={degree}, priority={pri}, incompatible_with={incompat}')
+
+    replacements = 0
+    all_nodes = list(globalMultiplexNums.nodes())
+
+    for prob_name, prob_degree, prob_pri, _ in problematic:
+        if prob_name not in outputInternalPrimers:
+            continue
+
+        prob_info = outputInternalPrimers[prob_name]
+        # The amplicon name from the primersToAmplNames mapping
+        prob_ampl_name = prob_info[-1] if len(prob_info) > 15 else None
+        if not prob_ampl_name:
+            continue
+
+        # Find the base region name to search for alternative primer pairs
+        region_base = prob_ampl_name[:prob_ampl_name.rfind('_')]
+
+        # Search for alternative primer pairs that cover the same region
+        best_alternative = None
+        best_degree = prob_degree
+
+        for primer_pair, ampl_names in primersToAmplNames.items():
+            # Check if this primer pair covers the same region
+            covers_region = False
+            for an in ampl_names:
+                if an.startswith(region_base):
+                    covers_region = True
+                    break
+            if not covers_region:
+                continue
+
+            # Skip if it's the same primer pair
+            current_pair = '_'.join(prob_info[:2])
+            if primer_pair == current_pair:
+                continue
+
+            # Check if this primer pair is in primersInfo (has valid data)
+            if primer_pair not in allPrimersInfo:
+                continue
+
+            # Calculate how many existing amplicons this alternative is compatible with
+            alt_primers = primer_pair.split('_')
+            if len(alt_primers) != 2:
+                continue
+            alt_info = allPrimersInfo[primer_pair]
+            alt_chrom = alt_info[4]
+            alt_start = alt_info[0][0][0]
+            alt_end = alt_info[0][1][0]
+
+            compatible_count = 0
+            for node in all_nodes:
+                if node == prob_name:
+                    continue
+                if node not in outputInternalPrimers:
+                    continue
+                fit, _ = checkPrimersFitFunc(
+                    alt_primers + [alt_chrom, alt_start, alt_end],
+                    outputInternalPrimers[node],
+                    args.minMultDimerdG1, args.minMultDimerdG2,
+                    args.maxPrimerIntersection, unspecificPrimers,
+                    args.mvConc, args.dvConc,
+                    args.dntpConc, args.primerConc,
+                    args.leftAdapter, args.rightAdapter)
+                if fit:
+                    compatible_count += 1
+
+            if compatible_count > best_degree:
+                best_degree = compatible_count
+                best_alternative = (primer_pair, alt_info, compatible_count)
+
+        if best_alternative:
+            alt_pair, alt_info, alt_degree = best_alternative
+            print(f'   Replacing {prob_name}: degree {prob_degree} -> {alt_degree} with alternative primers')
+            logger.info(f'   Replacing {prob_name}: degree {prob_degree} -> {alt_degree}')
+
+            # Update the compatibility graph
+            old_edges = list(globalMultiplexNums.neighbors(prob_name))
+            # Remove old node and re-add with new edges
+            globalMultiplexNums.remove_node(prob_name)
+            globalMultiplexNums.add_node(prob_name)
+
+            alt_primers = alt_pair.split('_')
+            for node in all_nodes:
+                if node == prob_name or node not in outputInternalPrimers:
+                    continue
+                fit, _ = checkPrimersFitFunc(
+                    alt_primers + [alt_info[4], alt_info[0][0][0], alt_info[0][1][0]],
+                    outputInternalPrimers[node],
+                    args.minMultDimerdG1, args.minMultDimerdG2,
+                    args.maxPrimerIntersection, unspecificPrimers,
+                    args.mvConc, args.dvConc,
+                    args.dntpConc, args.primerConc,
+                    args.leftAdapter, args.rightAdapter)
+                if fit:
+                    globalMultiplexNums.add_edge(node, prob_name)
+
+            # Update output primers info
+            outputInternalPrimers[prob_name][0] = alt_primers[0]
+            outputInternalPrimers[prob_name][1] = alt_primers[1]
+            replacements += 1
+
+    if replacements > 0:
+        print(f' # Smart re-selection: made {replacements} replacements')
+        logger.info(f' # Smart re-selection: made {replacements} replacements')
+    else:
+        print(' # Smart re-selection: no better alternatives found')
+        logger.info(' # Smart re-selection: no better alternatives found')
+
+    return replacements
+
+
+def sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultiplexNums,args,
+                                          readyMultiplexes=[],amplNameToPriority={}):
+    """
+    Priority-aware multiplex assignment.
+    Phase 1: Place priority-1 amplicons using the standard algorithm.
+    Phase 2: Insert priority-2 amplicons into existing multiplex pools.
+    Phase 3: Insert priority-3 amplicons into existing multiplex pools.
+    Falls back to original behavior when no priority info or all same priority.
+    """
+    # Check if priority info is meaningful
+    hasPriorities=len(amplNameToPriority)>0 and len(set(amplNameToPriority.values()))>1
+    if not hasPriorities:
+        return sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,args,readyMultiplexes)
+
+    # Separate amplicons by priority
+    allNodes=set(globalMultiplexNums.nodes())
+    pri1_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==1)
+    pri2_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==2)
+    pri3_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==3)
+
+    print('\n # Priority-based multiplex assignment:')
+    print('   Priority 1 amplicons:',len(pri1_nodes))
+    print('   Priority 2 amplicons:',len(pri2_nodes))
+    print('   Priority 3 amplicons:',len(pri3_nodes))
+    logger.info(' # Priority-based multiplex assignment:')
+    logger.info('   Priority 1 amplicons: '+str(len(pri1_nodes)))
+    logger.info('   Priority 2 amplicons: '+str(len(pri2_nodes)))
+    logger.info('   Priority 3 amplicons: '+str(len(pri3_nodes)))
+
+    # Phase 1: Build subgraph of priority-1 amplicons and place them
+    pri1_container={}
+    for key,nodes in globalMultiplexesContainer.items():
+        pri1_in=sorted([n for n in nodes if n in pri1_nodes])
+        if pri1_in:
+            pri1_container[key]=pri1_in
+
+    # Filter readyMultiplexes to only include priority-1 amplicons
+    pri1_readyMultiplexes=[]
+    for mult in readyMultiplexes:
+        pri1_readyMultiplexes.append([a for a in mult if a in pri1_nodes or a not in allNodes])
+
+    if len(pri1_container)>0:
+        pri1_subgraph=globalMultiplexNums.subgraph(list(pri1_nodes))
+        multiplexes=sortAmpliconsToMultiplexes(pri1_container,pri1_subgraph,args,pri1_readyMultiplexes)
+    else:
+        multiplexes=[]
+
+    placed_pri1=sum(len(m) for m in multiplexes)
+    print(' # Priority 1: placed',placed_pri1,'/',len(pri1_nodes),'amplicons')
+    logger.info(' # Priority 1: placed '+str(placed_pri1)+'/'+str(len(pri1_nodes))+' amplicons')
+
+    # Phase 2: Insert priority-2 amplicons into existing multiplex pools
+    if len(pri2_nodes)>0 and len(multiplexes)>0:
+        placed_pri2=0
+        unplaced_pri2=[]
+        # Sort by number of compatible primers (most compatible first for better packing)
+        pri2_sorted=sorted(pri2_nodes,
+                           key=lambda n:globalMultiplexNums.degree(n),reverse=True)
+        for node in pri2_sorted:
+            placed=False
+            neighbors=set(globalMultiplexNums.neighbors(node))
+            # Try each multiplex, pick the one where it fits and has the most room
+            for mult in multiplexes:
+                if all(m in neighbors for m in mult):
+                    mult.append(node)
+                    placed=True
+                    placed_pri2+=1
+                    break
+            if not placed:
+                unplaced_pri2.append(node)
+        print(' # Priority 2: placed',placed_pri2,'/',len(pri2_nodes),'amplicons')
+        logger.info(' # Priority 2: placed '+str(placed_pri2)+'/'+str(len(pri2_nodes))+' amplicons')
+        if unplaced_pri2:
+            print('   Could not place',len(unplaced_pri2),'priority-2 amplicons:')
+            logger.warn('   Could not place '+str(len(unplaced_pri2))+' priority-2 amplicons:')
+            for a in sorted(unplaced_pri2):
+                print('  ',a)
+                logger.warn('   '+a)
+
+    # Phase 3: Insert priority-3 amplicons
+    if len(pri3_nodes)>0 and len(multiplexes)>0:
+        placed_pri3=0
+        unplaced_pri3=[]
+        pri3_sorted=sorted(pri3_nodes,
+                           key=lambda n:globalMultiplexNums.degree(n),reverse=True)
+        for node in pri3_sorted:
+            placed=False
+            neighbors=set(globalMultiplexNums.neighbors(node))
+            for mult in multiplexes:
+                if all(m in neighbors for m in mult):
+                    mult.append(node)
+                    placed=True
+                    placed_pri3+=1
+                    break
+            if not placed:
+                unplaced_pri3.append(node)
+        print(' # Priority 3: placed',placed_pri3,'/',len(pri3_nodes),'amplicons')
+        logger.info(' # Priority 3: placed '+str(placed_pri3)+'/'+str(len(pri3_nodes))+' amplicons')
+        if unplaced_pri3:
+            print('   Could not place',len(unplaced_pri3),'priority-3 amplicons:')
+            logger.warn('   Could not place '+str(len(unplaced_pri3))+' priority-3 amplicons:')
+            for a in sorted(unplaced_pri3):
+                print('  ',a)
+                logger.warn('   '+a)
+
+    return multiplexes
+
 # Function that checks that new primer fits one of the multiplexes
 ## primers is a list of two primers and their amplicon coordinates [primer1, primer2, amplStart, amplEnd]
 ## nums are numbers of multiplexes to which we try to put new primer
 ## globalMultiplexNums are lists of multiplexes with primers and their amplicon coordinates [primer1, primer2, amplStart, amplEnd]
-## unspecificPrimers is a list of primer pairs that form unspecific products 
+## unspecificPrimers is a list of primer pairs that form unspecific products
 def checkPrimersFit(primers,primersToCompare,
                     minmultdimerdg1=-6,minmultdimerdg2=-10,
                     maxIntersectionOfPrimers=5,
@@ -3064,6 +3350,11 @@ par.add_argument('--auto-adjust-parameters','-autoadjust',
                  dest='autoAdjust',action='store_true',
                  help='use this parameter if you want NGS-PrimerPlex to automatically use less stringent parameters '
                       'if no primer were constructed for some region')
+par.add_argument('--smart-reselection','-smartreselect',
+                 dest='smartReselection',action='store_true',
+                 help='when enabled, after multiplex assignment, identify problematic primers '
+                      '(those that block many others from being placed) and attempt to replace '
+                      'them with alternative primer pairs that have better compatibility')
 par.add_argument('--tries-to-get-best-combination','-tries',
                  dest='triesToGetCombination',type=int,
                  help='number of of tries to get the best primer combination. '
@@ -3248,7 +3539,7 @@ chrToChr(args,refFa)
 ## Later we will send them into multithreading pool
 print('Reading input file...')
 logger.info('Reading input file...')
-allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType=readInputFile(regionsFile)
+allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType,regionNameToPriority=readInputFile(regionsFile)
 
 # If user also used file with primers
 if args.primersFile:
@@ -3629,7 +3920,7 @@ if args.primersFile:
                     print('Try to change multiplex numbers in the input file.')
                     logger.warn('Try to change multiplex numbers in the input file.')
                 else:
-                    leftUnsortedAmpls=leftNodesGraph.nodes()
+                    leftUnsortedAmpls=list(leftNodesGraph.nodes())
                     print('NGS_primerplex will try to add them to the next group of multiplexes.')
                     logger.warn('NGS_primerplex will try to add them to the next group of multiplexes.')
             else:
@@ -3876,6 +4167,8 @@ else:
         globalMultiplexNums=nx.Graph()
         globalMultiplexesContainer={}
         amplNameToRowNum={}
+        # Maps output amplicon names to their priority level (1, 2, or 3)
+        amplNameToPriority={}
         # Converts amplicon name basis into variants of amplicon names
         amplNamesToOutput={}
         # Converts primer pair sequences to output amplicon name
@@ -3944,6 +4237,9 @@ else:
                     # Replace it in the amplNameToRowNum
                     amplNameToRowNum[amplNamesToOutput[targetName][1]+'_1']=amplNameToRowNum[amplNamesToOutput[targetName][1]]
                     amplNameToRowNum.pop(amplNamesToOutput[targetName][1])
+                    # Replace it in the amplNameToPriority
+                    if amplNamesToOutput[targetName][1] in amplNameToPriority:
+                        amplNameToPriority[amplNamesToOutput[targetName][1]+'_1']=amplNameToPriority.pop(amplNamesToOutput[targetName][1])
                     # Replace it in the output files and list
                     amplNamesToOutput[targetName][1]+='_1'
                     # Replace it in the primerPairSeqsToOutputName
@@ -3982,6 +4278,8 @@ else:
                                                                            amplBlockEnd,leftPrimerTm,rightPrimerTm,len(c[0]),
                                                                            len(c[1]),leftGC,rightGC,amplName]
                 amplNameToRowNum[amplNamesToOutput[targetName][-1]]=rowNum
+                # Map output amplicon name to its region priority
+                amplNameToPriority[amplNamesToOutput[targetName][-1]]=regionNameToPriority.get(regionName,1)
                 primerPairSeqsToOutputName[('_'.join(c))]=amplNamesToOutput[targetName][-1]
                 numAmplNameToPrimerPair[amplName]='_'.join(c)
                 # If user set for all regions numbers of multiplexes
@@ -4044,7 +4342,12 @@ else:
                         currentReadyMultiplexes[i].append(primerPairSeqsToOutputName[numAmplNameToPrimerPair[primerPair]])
 ##            print('DEBUG:',currentReadyMultiplexes)
 ##            print('DEBUG:',globalMultiplexesContainer)
-            multiplexes=sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,args,currentReadyMultiplexes)
+            # Smart re-selection: try to replace problematic primers with better alternatives
+            if args.smartReselection:
+                smartReselection(globalMultiplexNums, amplNameToPriority, outputInternalPrimers,
+                                 primersInfo, primersToAmplNames, checkPrimersFit,
+                                 args, unspecificPrimers)
+            multiplexes=sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultiplexNums,args,currentReadyMultiplexes,amplNameToPriority)
             for k,multiplex in enumerate(multiplexes):
                 for ampl in multiplex:
                     primerPair=','.join(outputInternalPrimers[ampl][:2])
@@ -4361,7 +4664,7 @@ else:
                     for primerPair in mult:
                         if primerPair not in outputExternalPrimers.keys():
                             currentReadyMultiplexes[i].remove(primerPair)
-                multiplexes=sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,args,currentReadyMultiplexes)
+                multiplexes=sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultiplexNums,args,currentReadyMultiplexes,amplNameToPriority)
                 for k,multiplex in enumerate(multiplexes):
                     for ampl in multiplex:
                         wsw2.write(amplNameToRowNum[ampl],18,k+1)

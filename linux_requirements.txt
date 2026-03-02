@@ -4,5 +4,5 @@ primer3-py
 pysam
 xlrd
 xlsxwriter
-networkx == 1.11
+networkx >= 2.6
 numpy
