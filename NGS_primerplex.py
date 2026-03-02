@@ -2178,6 +2178,11 @@ def joinAmpliconsToBlocks(poolArgs):
     blocksFinalShortestPaths=[]
     leftGoodPrimers=[]
     for i,blockGraph in enumerate(blockGraphs):
+        # Skip blocks where first/last nodes have no primers (can happen with --skip-uncovered)
+        if firstNodes[i] not in blockGraph.nodes() or (firstNodes[i]!=lastNodes[i] and lastNodes[i] not in blockGraph.nodes()):
+            logger.warning('Block '+str(i)+' on chromosome '+str(chrom)+' has no valid primers for positions '+str(firstNodes[i])+'-'+str(lastNodes[i])+' - skipping')
+            blocksFinalShortestPaths.append([])
+            continue
         if firstNodes[i]==lastNodes[i]:
             try:
                 paths=tuple(nx.algorithms.shortest_paths.generic.all_shortest_paths(blockGraph,firstNodes[i],'end'))
@@ -2205,10 +2210,16 @@ def joinAmpliconsToBlocks(poolArgs):
         else:
             tries=0
             nodeToPrimerDimers={}
+            _skip_block=False
             while(True):
                 try:
                     path=tuple(nx.algorithms.shortest_paths.generic.shortest_path(blockGraph,firstNodes[i],lastNodes[i]))
-                except nx.exception.NetworkXNoPath as e:
+                except (nx.exception.NetworkXNoPath, nx.exception.NodeNotFound) as e:
+                    if args.skipUndesigned and len(nodeToPrimerDimers.keys())==0 and args.maxoverlap<args.maxAmplLen:
+                        print('WARNING: Block '+str(i)+' on chromosome '+str(chrom)+': path not found - skipping (--skip-uncovered)')
+                        logger.warning('Block '+str(i)+' on chromosome '+str(chrom)+': path not found - skipping')
+                        _skip_block=True
+                        break
                     if len(nodeToPrimerDimers.keys())>0:
                         for blockGraph in blockGraphs:
                             for node in blockGraph.nodes():
@@ -2246,6 +2257,11 @@ def joinAmpliconsToBlocks(poolArgs):
                             break
                         continue
                     else:
+                        if args.skipUndesigned:
+                            print('WARNING: Block '+str(i)+' on chromosome '+str(chrom)+': '+str(lastNodes[i])+' is not reachable from '+str(firstNodes[i])+' - skipping (--skip-uncovered)')
+                            logger.warning('Block '+str(i)+' on chromosome '+str(chrom)+': '+str(lastNodes[i])+' is not reachable from '+str(firstNodes[i])+' - skipping')
+                            _skip_block=True
+                            break  # breaks while loop; _skip_block flag checked after
                         print('ERROR (25)! Too low value of maximal overlap (-maxoverlap) or of initially designed primers (-primernum): '+str(args.maxoverlap)+' and '+str(args.primernum1)+'. Try to increase one of them')
                         logger.error(' Too low value of maximal overlap (-maxoverlap) or of initially designed primers (-primernum): '+str(args.maxoverlap)+' and '+str(args.primernum1)+'. Try to increase one of them')
                         print(str(lastNodes[i])+' is not reachable from '+str(firstNodes[i]))
@@ -2283,6 +2299,9 @@ def joinAmpliconsToBlocks(poolArgs):
                         blockGraph.remove_node(node)
                         break
                     tries=0
+            if _skip_block:
+                blocksFinalShortestPaths.append([])
+                continue
             g1=blockGraph.subgraph(path)
             shortestPaths={path:len(path)}
             minPathLen=len(path)
@@ -4141,6 +4160,10 @@ else:
 ##                                                                args.maxAmplLen,chromInt,
 ##                                                                args.returnVariantsNum)))
         except KeyError:
+            if args.skipUndesigned:
+                print('WARNING: Chromosome '+str(chrom)+' ('+str(chromInt)+') has no valid primer pairs after filtering - skipping')
+                logger.warning('Chromosome '+str(chrom)+' ('+str(chromInt)+') has no valid primer pairs after filtering - skipping')
+                continue
             print('ERROR (60)! The following chromosome does not covered by any primer pair:')
             logger.error('(60)  The following chromosome does not covered by any primer pair:')
             print('Chromosome as number: '+str(chromInt))
@@ -4171,6 +4194,11 @@ else:
     writeDraftPrimers(primersInfo,
                       args.regionsFile[:-4]+'_all_draft_primers_after_joinment.xls',
                       allLeftGoodPrimers)
+    # Filter out empty blocks (from --skip-uncovered) before statistics and combination selection
+    for chromInt in list(allRegionsAmplifiedBlocks.keys()):
+        allRegionsAmplifiedBlocks[chromInt]=[b for b in allRegionsAmplifiedBlocks[chromInt] if len(b)>0]
+        if len(allRegionsAmplifiedBlocks[chromInt])==0:
+            del allRegionsAmplifiedBlocks[chromInt]
     # We need to show user statistics of amplified blocks
     totalAmplicons=0
     totalMultiplexVariants=1

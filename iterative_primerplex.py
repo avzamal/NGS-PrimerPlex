@@ -167,6 +167,27 @@ def create_priority_subset(regions_file, output_file, max_priority):
                 fout.write(line)
 
 
+def _find_intermediate_draft(input_base):
+    """Find the best intermediate draft file produced by NGS_primerplex.py.
+    These files are named based on the input regions file (not --run-name):
+      *_all_draft_primers_after_specificity.xls  (best - passed specificity)
+      *_all_draft_primers_after_SNPs.xls         (passed SNP check)
+      *_all_draft_primers_after_joinment.xls     (after block joining)
+      *_all_draft_primers.xls                    (all candidates from primer3)
+    Returns the path to the best available file, or None.
+    """
+    candidates = [
+        f'{input_base}_all_draft_primers_after_specificity.xls',
+        f'{input_base}_all_draft_primers_after_SNPs.xls',
+        f'{input_base}_all_draft_primers_after_joinment.xls',
+        f'{input_base}_all_draft_primers.xls',
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    return None
+
+
 def run_primerplex(regions_file, ref_genome, primer_num, run_name,
                    draft_file=None, extra_args=None):
     """Run NGS_primerplex.py with given parameters. Returns exit code."""
@@ -269,6 +290,11 @@ def main():
                 info_file = f'{input_base}_{run_name}_primers_combination_1_info.xls'
                 if not os.path.exists(info_file):
                     print(f'WARNING: Expected output not found: {info_file}')
+                    # Use intermediate draft files as fallback (best available)
+                    intermediate_draft = _find_intermediate_draft(input_base)
+                    if intermediate_draft and intermediate_draft != draft_file:
+                        draft_file = intermediate_draft
+                        print(f'  Using intermediate draft: {draft_file}')
                     print(f'  Trying next primer number...')
                     continue
 
@@ -309,6 +335,10 @@ def main():
             info_file = f'{input_base}_{run_name}_primers_combination_1_info.xls'
             if not os.path.exists(info_file):
                 print(f'WARNING: Expected output not found: {info_file}')
+                intermediate_draft = _find_intermediate_draft(input_base)
+                if intermediate_draft and intermediate_draft != draft_file:
+                    draft_file = intermediate_draft
+                    print(f'  Using intermediate draft: {draft_file}')
                 continue
 
             final_info_file = info_file
