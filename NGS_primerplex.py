@@ -2652,7 +2652,7 @@ def sortAmpliconsToMultiplexes(globalMultiplexesContainer,globalMultiplexNums,ar
         mults=key.split('_')
         localMultiplexNums=nx.Graph()
         # Create subgraph for primer pairs that should be sorted to the same set of pools (e.g. current is 1_2, but some another 3_4)
-        localMultiplexNums=globalMultiplexNums.subgraph(containerNodes+leftUnsortedAmpls)
+        localMultiplexNums=globalMultiplexNums.subgraph(containerNodes+leftUnsortedAmpls).copy()
         cls=[]
         cls=makeFinalMultiplexes(localMultiplexNums,readyMultiplexes,len(mults),len(mults),True)
         multiplexes.extend(cls)
@@ -2863,10 +2863,31 @@ def smartReselection(globalMultiplexNums, amplNameToPriority, outputInternalPrim
     return replacements
 
 
+def _insertAmpliconsIntoMultiplexes(nodes,globalMultiplexNums,multiplexes,label=''):
+    """Helper: try to insert amplicons into existing multiplex pools.
+    Returns (placed_count, unplaced_list)."""
+    placed=0
+    unplaced=[]
+    # Sort by degree descending (most compatible first)
+    nodes_sorted=sorted(nodes,key=lambda n:globalMultiplexNums.degree(n),reverse=True)
+    for node in nodes_sorted:
+        inserted=False
+        neighbors=set(globalMultiplexNums.neighbors(node))
+        for mult in multiplexes:
+            if all(m in neighbors for m in mult):
+                mult.append(node)
+                inserted=True
+                placed+=1
+                break
+        if not inserted:
+            unplaced.append(node)
+    return placed,unplaced
+
 def sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultiplexNums,args,
                                           readyMultiplexes=[],amplNameToPriority={}):
     """
     Priority-aware multiplex assignment.
+    Phase 0: Place force-include (priority 0) amplicons first.
     Phase 1: Place priority-1 amplicons using the standard algorithm.
     Phase 2: Insert priority-2 amplicons into existing multiplex pools.
     Phase 3: Insert priority-3 amplicons into existing multiplex pools.
@@ -2879,11 +2900,18 @@ def sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultip
 
     # Separate amplicons by priority
     allNodes=set(globalMultiplexNums.nodes())
+    pri0_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==0)
     pri1_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==1)
     pri2_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==2)
     pri3_nodes=set(n for n in allNodes if amplNameToPriority.get(n,1)==3)
 
+    # Merge priority 0 (force-include) with priority 1 for initial placement
+    core_nodes=pri0_nodes | pri1_nodes
+
     print('\n # Priority-based multiplex assignment:')
+    if pri0_nodes:
+        print('   Force-include (priority 0) amplicons:',len(pri0_nodes))
+        logger.info('   Force-include (priority 0) amplicons: '+str(len(pri0_nodes)))
     print('   Priority 1 amplicons:',len(pri1_nodes))
     print('   Priority 2 amplicons:',len(pri2_nodes))
     print('   Priority 3 amplicons:',len(pri3_nodes))
@@ -2892,47 +2920,76 @@ def sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultip
     logger.info('   Priority 2 amplicons: '+str(len(pri2_nodes)))
     logger.info('   Priority 3 amplicons: '+str(len(pri3_nodes)))
 
-    # Phase 1: Build subgraph of priority-1 amplicons and place them
-    pri1_container={}
+    # Phase 0+1: Build subgraph of core amplicons (priority 0 + 1) and place them
+    core_container={}
     for key,nodes in globalMultiplexesContainer.items():
-        pri1_in=sorted([n for n in nodes if n in pri1_nodes])
-        if pri1_in:
-            pri1_container[key]=pri1_in
+        core_in=sorted([n for n in nodes if n in core_nodes])
+        if core_in:
+            core_container[key]=core_in
 
-    # Filter readyMultiplexes to only include priority-1 amplicons
-    pri1_readyMultiplexes=[]
+    # Filter readyMultiplexes to only include core amplicons
+    core_readyMultiplexes=[]
     for mult in readyMultiplexes:
-        pri1_readyMultiplexes.append([a for a in mult if a in pri1_nodes or a not in allNodes])
+        core_readyMultiplexes.append([a for a in mult if a in core_nodes or a not in allNodes])
 
-    if len(pri1_container)>0:
-        pri1_subgraph=globalMultiplexNums.subgraph(list(pri1_nodes))
-        multiplexes=sortAmpliconsToMultiplexes(pri1_container,pri1_subgraph,args,pri1_readyMultiplexes)
+    if len(core_container)>0:
+        core_subgraph=globalMultiplexNums.subgraph(list(core_nodes)).copy()
+        multiplexes=sortAmpliconsToMultiplexes(core_container,core_subgraph,args,core_readyMultiplexes)
     else:
         multiplexes=[]
 
-    placed_pri1=sum(len(m) for m in multiplexes)
-    print(' # Priority 1: placed',placed_pri1,'/',len(pri1_nodes),'amplicons')
-    logger.info(' # Priority 1: placed '+str(placed_pri1)+'/'+str(len(pri1_nodes))+' amplicons')
+    # Check force-include placement
+    placed_all=set()
+    for m in multiplexes:
+        placed_all.update(m)
+
+    if pri0_nodes:
+        placed_pri0=pri0_nodes & placed_all
+        unplaced_pri0=pri0_nodes - placed_all
+        print(' # Force-include: placed',len(placed_pri0),'/',len(pri0_nodes),'amplicons')
+        logger.info(' # Force-include: placed '+str(len(placed_pri0))+'/'+str(len(pri0_nodes))+' amplicons')
+
+        if unplaced_pri0:
+            print(' WARNING! The following force-include amplicons could NOT be placed:')
+            logger.warn(' The following force-include amplicons could NOT be placed:')
+            for node in sorted(unplaced_pri0):
+                neighbors=set(globalMultiplexNums.neighbors(node))
+                # Find which placed amplicons are blocking this one
+                blockers=[]
+                for m_idx,mult in enumerate(multiplexes):
+                    for placed_ampl in mult:
+                        if placed_ampl not in neighbors:
+                            blockers.append((placed_ampl,m_idx+1,amplNameToPriority.get(placed_ampl,1)))
+                # Sort blockers: lowest priority first (best candidates for removal)
+                blockers.sort(key=lambda x:(-x[2],x[0]))
+                print('   '+node+' - blocked by '+str(len(blockers))+' amplicons:')
+                logger.warn('   '+node+' - blocked by '+str(len(blockers))+' amplicons:')
+                # Show top blockers with removal suggestion
+                shown=0
+                for blocker,mult_idx,blocker_pri in blockers:
+                    if shown>=10:
+                        print('     ... and',len(blockers)-10,'more')
+                        break
+                    label='SUGGEST REMOVE' if blocker_pri>=2 else ''
+                    print('     '+blocker+' (multiplex '+str(mult_idx)+', priority '+str(blocker_pri)+') '+label)
+                    logger.warn('     '+blocker+' (multiplex '+str(mult_idx)+', priority '+str(blocker_pri)+') '+label)
+                    shown+=1
+                # Check if removing lowest-priority blockers would help
+                removable=[b for b in blockers if b[2]>=2]
+                if removable:
+                    print('   -> Suggestion: remove '+str(min(len(removable),3))+' lowest-priority blockers to make room')
+                    logger.info('   -> Suggestion: remove lowest-priority blockers to make room for '+node)
+                else:
+                    print('   -> All blockers are priority 0-1. Manual review needed.')
+                    logger.warn('   -> All blockers are priority 0-1. Manual review needed for '+node)
+
+    placed_core=sum(len(m) for m in multiplexes)
+    print(' # Priority 0+1: placed',placed_core,'/',len(core_nodes),'amplicons')
+    logger.info(' # Priority 0+1: placed '+str(placed_core)+'/'+str(len(core_nodes))+' amplicons')
 
     # Phase 2: Insert priority-2 amplicons into existing multiplex pools
     if len(pri2_nodes)>0 and len(multiplexes)>0:
-        placed_pri2=0
-        unplaced_pri2=[]
-        # Sort by number of compatible primers (most compatible first for better packing)
-        pri2_sorted=sorted(pri2_nodes,
-                           key=lambda n:globalMultiplexNums.degree(n),reverse=True)
-        for node in pri2_sorted:
-            placed=False
-            neighbors=set(globalMultiplexNums.neighbors(node))
-            # Try each multiplex, pick the one where it fits and has the most room
-            for mult in multiplexes:
-                if all(m in neighbors for m in mult):
-                    mult.append(node)
-                    placed=True
-                    placed_pri2+=1
-                    break
-            if not placed:
-                unplaced_pri2.append(node)
+        placed_pri2,unplaced_pri2=_insertAmpliconsIntoMultiplexes(pri2_nodes,globalMultiplexNums,multiplexes)
         print(' # Priority 2: placed',placed_pri2,'/',len(pri2_nodes),'amplicons')
         logger.info(' # Priority 2: placed '+str(placed_pri2)+'/'+str(len(pri2_nodes))+' amplicons')
         if unplaced_pri2:
@@ -2944,21 +3001,7 @@ def sortAmpliconsToMultiplexesByPriority(globalMultiplexesContainer,globalMultip
 
     # Phase 3: Insert priority-3 amplicons
     if len(pri3_nodes)>0 and len(multiplexes)>0:
-        placed_pri3=0
-        unplaced_pri3=[]
-        pri3_sorted=sorted(pri3_nodes,
-                           key=lambda n:globalMultiplexNums.degree(n),reverse=True)
-        for node in pri3_sorted:
-            placed=False
-            neighbors=set(globalMultiplexNums.neighbors(node))
-            for mult in multiplexes:
-                if all(m in neighbors for m in mult):
-                    mult.append(node)
-                    placed=True
-                    placed_pri3+=1
-                    break
-            if not placed:
-                unplaced_pri3.append(node)
+        placed_pri3,unplaced_pri3=_insertAmpliconsIntoMultiplexes(pri3_nodes,globalMultiplexNums,multiplexes)
         print(' # Priority 3: placed',placed_pri3,'/',len(pri3_nodes),'amplicons')
         logger.info(' # Priority 3: placed '+str(placed_pri3)+'/'+str(len(pri3_nodes))+' amplicons')
         if unplaced_pri3:
@@ -3355,6 +3398,17 @@ par.add_argument('--smart-reselection','-smartreselect',
                  help='when enabled, after multiplex assignment, identify problematic primers '
                       '(those that block many others from being placed) and attempt to replace '
                       'them with alternative primer pairs that have better compatibility')
+par.add_argument('--force-include','-forceinc',
+                 dest='forceInclude',type=str,
+                 help='file with region names (one per line) that MUST be included in the multiplex. '
+                      'These regions get highest priority (0). If they cannot fit, the tool will '
+                      'suggest which existing primers to remove. Primers-number1 is automatically '
+                      'escalated up to --force-include-max-primers for these regions.',
+                 required=False,default=None)
+par.add_argument('--force-include-max-primers','-forcemaxpn',
+                 dest='forceIncludeMaxPrimers',type=int,
+                 help='maximum primers-number1 to try for force-include regions. Default: 1000',
+                 required=False,default=1000)
 par.add_argument('--tries-to-get-best-combination','-tries',
                  dest='triesToGetCombination',type=int,
                  help='number of of tries to get the best primer combination. '
@@ -3540,6 +3594,27 @@ chrToChr(args,refFa)
 print('Reading input file...')
 logger.info('Reading input file...')
 allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType,regionNameToPriority=readInputFile(regionsFile)
+
+# If user defined force-include regions, set their priority to 0 (highest)
+if args.forceInclude:
+    forceIncludeNames=set()
+    with open(args.forceInclude) as fif:
+        for line in fif:
+            name=line.strip()
+            if name and not name.startswith('#'):
+                forceIncludeNames.add(name)
+    forcedCount=0
+    for rName,subNames in regionsNames.items():
+        if rName in forceIncludeNames:
+            for subName in subNames:
+                regionNameToPriority[subName]=0
+                forcedCount+=1
+    print(' # Force-include: set',forcedCount,'sub-regions from',len(forceIncludeNames),'regions to priority 0')
+    logger.info(' # Force-include: set '+str(forcedCount)+' sub-regions from '+str(len(forceIncludeNames))+' regions to priority 0')
+    notFound=forceIncludeNames-set(regionsNames.keys())
+    if notFound:
+        print(' WARNING! Force-include regions not found in input file:',', '.join(sorted(notFound)))
+        logger.warn(' Force-include regions not found in input file: '+', '.join(sorted(notFound)))
 
 # If user also used file with primers
 if args.primersFile:
@@ -3889,7 +3964,7 @@ if args.primersFile:
             logger.info('Sorting amplicons to multiplexes '+str(key)+' (contain '+str(len(containerNodes+leftUnsortedAmpls))+' amplicons)...')
             mults=key.split('_')
             localMultiplexNums=nx.Graph()
-            localMultiplexNums=globalMultiplexNums.subgraph(containerNodes+leftUnsortedAmpls)
+            localMultiplexNums=globalMultiplexNums.subgraph(containerNodes+leftUnsortedAmpls).copy()
             cls=[]
             cls=makeFinalMultiplexes(localMultiplexNums,[],len(mults),True)
             multiplexes.extend(cls)
