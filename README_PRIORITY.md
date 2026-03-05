@@ -11,7 +11,7 @@ Extended fork of [NGS-PrimerPlex](https://github.com/aakechin/NGS-PrimerPlex) wi
 sudo apt install bwa
 
 # Python dependencies
-pip3 install biopython primer3-py pysam networkx numpy xlrd==1.2.0 xlsxwriter lxml openpyxl
+pip3 install biopython primer3-py pysam networkx numpy xlrd==1.2.0
 ```
 
 ### Clone
@@ -202,15 +202,21 @@ All other arguments are passed through to `NGS_primerplex.py` (e.g., `--do-blast
 
 ## Output
 
-Standard NGS-PrimerPlex output files are produced:
-- `*_primers_combination_N.xls` — Primer sequences
-- `*_primers_combination_N_info.xls` — Detailed info including multiplex assignment
+All output files are TSV (tab-separated values), easy to inspect with standard Unix tools and spreadsheet software.
+
+- `*_primers_combination_N_info_ngs_primerplex_internal_primers.tsv` — Internal primers with multiplex assignment
+- `*_primers_combination_N_info_ngs_primerplex_external_primers.tsv` — External primers (if embedded amplification is used)
 - `*_primers_combination_N.fa` — FASTA of primer sequences
 - `*_primers_combination_N_internal_amplicons.fa` — Internal amplicon sequences
+- `*_draft_internal.tsv` / `*_draft_external.tsv` — Draft primers for subsequent runs
+
+Multi-sheet workbooks (specificity, incompatibility) are split into separate TSV files with descriptive suffixes.
 
 The `Designed_Multiplex` column in the info file indicates which multiplex pool each primer pair was assigned to. Empty means the primer was not placed in any pool.
 
 When using priority-based assignment, the console output shows placement statistics per priority level.
+
+**Backwards compatibility:** `readDraftPrimers()` can still read legacy `.xls` draft files produced by earlier versions.
 
 ---
 
@@ -240,7 +246,7 @@ python3 NGS_primerplex.py \
     --reference-genome genome.fna \
     --primers-number1 100 \
     --run-name panel_v2 \
-    --draft-primers panel_v1_draft.xls \
+    --draft-primers panel_v1_draft.tsv \
     --force-include force_include.txt \
     --smart-reselection \
     --do-blast \
@@ -258,3 +264,5 @@ python3 NGS_primerplex.py \
 5. **Smart primer re-selection** (`--smart-reselection`) — Replaces low-compatibility primers
 6. **Force-include** (`--force-include`) — Guarantees specific regions in multiplex or reports blockers
 7. **Iterative runner** (`iterative_primerplex.py`) — Automated escalating primer number runs
+8. **TSV output format** — All output files switched from XLSX to plain TSV for easier inspection and processing. `xlsxwriter` dependency removed. Multi-sheet workbooks produce separate TSV files with descriptive suffixes. Legacy `.xls` draft files can still be read for backwards compatibility.
+9. **Performance improvements** — Parallelized `joinAmpliconsToBlocks`, early termination in pairwise comparisons, removed per-chromosome caps

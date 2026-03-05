@@ -69,14 +69,13 @@ Also additional Python-modules can be installed manually:
 * argparse
 * primer3-py (as program for choosing primer pairs for one region, NGS-PrimerPlex uses primer3-py Python package)
 * pysam
-* xlrd
-* xlsxwriter
-* networkx (version==1.11, newer versions have different sintaxis)
+* xlrd (only needed for reading legacy `.xls` draft files)
+* networkx (version >= 2.6)
 * numpy
 
 They can be installed with pip:
 
-`sudo pip3 install biopython argparse primer3-py pysam xlrd xlsxwriter "networkx==1.11" numpy`
+`sudo pip3 install biopython argparse primer3-py pysam xlrd "networkx>=2.6" numpy`
 
 Also, for searching non-target primer hybridization, it uses BWA, so you will also need to install it manually with e.g.:
 
@@ -115,7 +114,7 @@ And, finally, you can run your primer design as it is written for your variant o
 1. If during redistribution of primer pairs among multiplex reactions, only 1-6 pairs could not be redistributed, try to run designing again with -draft option and increasing -returnvatiantsnum option. Because, choosing primer pair combinations is quite stochastic, sometimes several restarts of design process can give good results.
 1. If you have problems with use of _**vim on Windows docker**_, type the command `:set term=cygwin` in the vim, and it will work fine.
 1. If you obtain error _**segmentation fault**_ in the docker container, increase memory and processor performance provided to your virtual machine in the Virtual Box settings.
-1. If some of the designed primers don't work or work with low efficiency, you can remove them from the output NGS-PrimerPlex file (\*info.xls) and begin designing again with -draft option.
+1. If some of the designed primers don't work or work with low efficiency, you can remove them from the output NGS-PrimerPlex file (\*info.tsv) and begin designing again with -draft option.
 ### Primers could not be designed with the defined parameters
 Thanks to the function of draft primers you can subsequently design primers with less and less stringent parameters. Below, the most frequently parameters that you need to change, are listed.
 1. Look at sequences that NGS-PrimerPlex outputed for regions for which primers could not be designed. In the most cases, you need to change GC-content of your primers. Leave optimal primer GC as you want, but change minimal and maximal GC-content.
@@ -124,7 +123,7 @@ Thanks to the function of draft primers you can subsequently design primers with
 1. If primers could not be joined into amplified blocks, increase -maxoverlap to allow overlapping of the neiborhing amplicons by their studied regions (between left and right primers). Also, if you have more time, you can try to increase -primernum1 parameter that will lead to designing more primers for each studied position.
 1. IMPORTANT! If you have draft-file with primers that were previously filtered by specificity and covering SNPs and you want to join them into multiplexes, you NEED to use -blast option in order to check primers for forming non-specific amplicons between primers from different pairs!
 1. If you gonna to design primers for embedded PCR, use higher number of returned variants (>=10), because not for all internal primers external primers can be designed.
-1. If you want to change distribution of your already designed primers into multiplex reactions, you can make draft XLS-file from the result (*_info.xls*) file and run NGS-PrimerPlex again. Or, if some of primer pairs couldn't be sorted to any of the multiplexes, you can remove such primer pairs from the "*_info.xls*" file, convert it to draft-file and run NGS-PrimerPlex to design new primers for this regions and to resort all primers into new multiplex reactions.
+1. If you want to change distribution of your already designed primers into multiplex reactions, you can use the result (*_info.tsv*) file directly as a draft file and run NGS-PrimerPlex again. Or, if some of primer pairs couldn't be sorted to any of the multiplexes, you can remove such primer pairs from the "*_info.tsv*" file and run NGS-PrimerPlex to design new primers for these regions and to resort all primers into new multiplex reactions.
 
 ## Description of all scripts
 Below three scripts of NGS-PrimerPlex are described in details.
@@ -172,9 +171,9 @@ In this file user can manually define the following features of primer design:
 * _**type of primers (left, right or both)**_. This can be useful, if someone creates amplicon-based library for detection of gene fusions and primers only from one side are needed. If you need both primers, you can leave it empty. In other cases, use "L", "R", or "B".
 * sometimes, especially, when long deletions are detected, you need to amplify _**whole region as one amplicon**_, e.g. EGFR deletion in the exon 19. For such regions, you can specify in this column "W", and NGS-PrimerPlex will try to design primers for whole such region. In other cases leave it empty or write something different (like NotW as it is written by default), and NGS-PrimerPlex will design primers for each position of this region distinctly and choose the best variant. Then it can cover whole region by one as well as several primer pairs.
 ### Other features of NGS-PrimerPlex can be used by defining parameters:
-1. _**Multi-step primer design**_ for NGS-panels with regions that have structure difficult for primer design. For example, you have regions with low GC-content. If you design primers in one step, you need to allow low GC-content for all primers designed. But if you do it in several steps, you can initially start designing primers with strict parameters. The program will construct primers for regions with normal GC-content and save them into "draft primers" file. For regions with too low or too high GC-content (or other parameters like Tm, poly-N length, number of non-target hybridizations etc.) it will raise an error. After that you can use parameter _-draft_ with choosing file that was generated by NGS-PrimerPlex (it ends with "all_draft_primers.xls") and choosing less strict parameters. Then the program will not design primers for regions for which primers have been constructed earlier. This will significantly speed up choosing acceptable primer design parameters.
-    - Similar approach can be used when some region has repeats in genome or contain high-frequent SNPs. In this case, you can use "draft primers" that have already passed filtering by genome mapping and/or checking for covering SNPs. This files end with "all_draft_primers_after_specificity.xls" and "all_draft_primers_after_SNPs.xls", respectively. The last one will have primers that passed also through mapping genome, if this was chosen. Remember, that for distributing primer pairs among multiplexes, you still need -blast option to check for forming non-specific amplicons between primers from different primer pairs!
-    - Another example of using draft-file is a redistribution of primer pairs among multiplex reactions if some primers couldn't be sorted. In this case, you can remove such primer pairs from the *_info.xls* file, convert it to draft file and run NGS-PrimerPlex again, with -blast option, too.
+1. _**Multi-step primer design**_ for NGS-panels with regions that have structure difficult for primer design. For example, you have regions with low GC-content. If you design primers in one step, you need to allow low GC-content for all primers designed. But if you do it in several steps, you can initially start designing primers with strict parameters. The program will construct primers for regions with normal GC-content and save them into "draft primers" file. For regions with too low or too high GC-content (or other parameters like Tm, poly-N length, number of non-target hybridizations etc.) it will raise an error. After that you can use parameter _-draft_ with choosing file that was generated by NGS-PrimerPlex (draft files end with "_draft_internal.tsv" and "_draft_external.tsv") and choosing less strict parameters. Then the program will not design primers for regions for which primers have been constructed earlier. This will significantly speed up choosing acceptable primer design parameters.
+    - Similar approach can be used when some region has repeats in genome or contain high-frequent SNPs. In this case, you can use "draft primers" that have already passed filtering by genome mapping and/or checking for covering SNPs. These files are named with suffixes "all_draft_primers_after_specificity_draft_internal.tsv" and "all_draft_primers_after_SNPs_draft_internal.tsv", respectively. The last one will have primers that passed also through mapping genome, if this was chosen. Remember, that for distributing primer pairs among multiplexes, you still need -blast option to check for forming non-specific amplicons between primers from different primer pairs!
+    - Another example of using draft-file is a redistribution of primer pairs among multiplex reactions if some primers couldn't be sorted. In this case, you can remove such primer pairs from the *_info.tsv* file, convert it to draft file and run NGS-PrimerPlex again, with -blast option, too.
 2. _**Checking primers for non-target hybridization**_. The program will check all of designed primers for number of non-target hybridizations in genome with defined number of substitutions/insertions/deletions. Primer pairs can be filtered out by number of such non-target sites for one of the primers (e.g. to exclude primers that are complement to genome repeats) and by forming non-target amplicons. Forming of non-target amplicons is checked both for each primer pairs designed and for primers from different pairs while combining them into multiplex reactions. For performing such analysis, use parameters -blast and -subst. The last one controls number of substitutions, insertions and deletions allowed while searching for primer sequences in genome.
 3. _**Checking primers for covering high-frequent SNPs**_. The program will check each primer for covering variable sites of genome by whole sequence or only by 3'-end. Number of nucleotides from 3'-end is controlled by the -nucs parameter. If you want to check whole primer, simply do not use this argument. This check is necessary for decreasing influence of sample SNPs onto amplification efficiency. For performing such analysis, use parameters -snps and -dbsnp with defining path to the VCF-file of dbSNP database (see detailed information above).
 4. _**Designing primers for embedded PCR**_. The program can design both internal and external primers for one run or design only external primers for previously designed internal primers. Use of external primers can increase sensitivity of amplicon-based NGS-panel. For doing it, use parameters -embedded, -minprimershift, -optextampllen, and -maxextampllen.
@@ -342,23 +341,23 @@ Other parameters of NGS-primerplex.py are listed below (the most of parameters h
                         the application
 ```
 ### addSeqToPrimers.py
-This script adds adapter sequences to all designed primers. As an input it uses NGS-primerplex.py output file and file with adapter sequences. Example files with adapter sequences are included into the repository. This script outputs sequences into new XLS-file listing all designed primers with names and adapter sequences added.
+This script adds adapter sequences to all designed primers. As an input it uses NGS-primerplex.py output file and file with adapter sequences. Example files with adapter sequences are included into the repository. This script outputs sequences into new file listing all designed primers with names and adapter sequences added.
 All parameters are listed below:
 ```
   -h, --help            show this help message and exit
   --input INPUT, -in INPUT
-                        input XLS-file with designed primers
+                        input file with designed primers (TSV or legacy XLS)
   --tags-file TAGSFILE, -tags TAGSFILE
                         text file with tags that we want to add to each
                         primer. Default: "/NGS-
                         PrimerPlex/kplex_for_primers.txt"
 ```
 ### convertToDraftFile.py
-This script converts the main NGS-PrimerPlex output file (*_info.xls* file) into draft file for subsequent use them as draft-file for redesigning some primers or redistributing them into another multiplex sets. All parameters are listed below:
+This script converts the main NGS-PrimerPlex output file (*_info.tsv* file) into draft file for subsequent use as draft-file for redesigning some primers or redistributing them into another multiplex sets. Note: with TSV output, info files can be used directly as draft input without conversion. All parameters are listed below:
 ```
   -h, --help            show this help message and exit
   --input INFILE, -in INFILE
-                        input XLS-file with primers designed by NGS-PrimerPlex
+                        input file with primers designed by NGS-PrimerPlex (TSV or legacy XLS)
   --output OUTFILE, -out OUTFILE
                         file for outputing draft file for NGS-PrimerPlex
 ```

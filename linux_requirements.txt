@@ -3,6 +3,5 @@ argparse
 primer3-py
 pysam
 xlrd
-xlsxwriter
 networkx >= 2.6
 numpy

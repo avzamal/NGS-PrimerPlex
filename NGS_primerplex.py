@@ -24,7 +24,6 @@ from multiprocessing import Pool
 from Bio import SeqIO,Seq,pairwise2
 import subprocess as sp
 from operator import itemgetter
-import xlsxwriter as xls
 import networkx as nx
 import networkx.algorithms.clique as clique
 import networkx.algorithms.shortest_paths.weighted as weighted_shortest_paths
@@ -33,6 +32,79 @@ from collections import Counter
 
 global thisDir,nameToNum,numToName
 thisDir=os.path.dirname(os.path.realpath(__file__))+'/'
+
+# TSV output classes that mimic xlsxwriter API for minimal code changes
+class TsvWorksheet:
+    """Buffer rows in memory, write TSV on close."""
+    def __init__(self, name):
+        self.name = name
+        self.rows = {}  # row_num -> {col_num: value}
+        self.max_col = 0
+
+    def write_row(self, row_num, col_start, values):
+        if row_num not in self.rows:
+            self.rows[row_num] = {}
+        for j, v in enumerate(values):
+            self.rows[row_num][col_start + j] = v
+            if col_start + j > self.max_col:
+                self.max_col = col_start + j
+
+    def write(self, row_num, col_num, value):
+        if row_num not in self.rows:
+            self.rows[row_num] = {}
+        self.rows[row_num][col_num] = value
+        if col_num > self.max_col:
+            self.max_col = col_num
+
+    def write_number(self, row_num, col_num, value):
+        self.write(row_num, col_num, value)
+
+    def set_column(self, *args):
+        pass  # No column widths in TSV
+
+    def get_tsv_lines(self):
+        if not self.rows:
+            return ''
+        max_row = max(self.rows.keys())
+        lines = []
+        for r in range(max_row + 1):
+            if r in self.rows:
+                cols = []
+                for c in range(self.max_col + 1):
+                    v = self.rows[r].get(c, '')
+                    cols.append(str(v))
+                lines.append('\t'.join(cols))
+        return '\n'.join(lines) + '\n'
+
+
+class TsvWorkbook:
+    """Multi-sheet TSV workbook. Each sheet becomes a separate .tsv file."""
+    def __init__(self, base_path):
+        # Strip .xls or .tsv extension to get base
+        for ext in ('.xls', '.tsv'):
+            if base_path.endswith(ext):
+                base_path = base_path[:-len(ext)]
+                break
+        self.base_path = base_path
+        self.sheets = []
+
+    def add_worksheet(self, name):
+        ws = TsvWorksheet(name)
+        self.sheets.append(ws)
+        return ws
+
+    def close(self):
+        if len(self.sheets) == 1:
+            path = self.base_path + '.tsv'
+            with open(path, 'w') as f:
+                f.write(self.sheets[0].get_tsv_lines())
+        else:
+            for ws in self.sheets:
+                safe_name = ws.name.lower().replace(' ', '_').replace("'", '')
+                path = self.base_path + '_' + safe_name + '.tsv'
+                with open(path, 'w') as f:
+                    f.write(ws.get_tsv_lines())
+
 
 # Section of functions
 def chrToChr(args,refFa):
@@ -134,8 +206,8 @@ def readInputFile(regionsFile):
                     if len(cols)>7 and cols[7].strip()!='':
                         try:
                             priority=int(cols[7].strip())
-                            if priority not in [1,2,3]:
-                                print('WARNING! Priority value should be 1, 2, or 3. Got:',priority,'. Using default 1.')
+                            if priority not in [0,1,2,3]:
+                                print('WARNING! Priority value should be 0, 1, 2, or 3. Got:',priority,'. Using default 1.')
                                 priority=1
                         except ValueError:
                             priority=1
@@ -187,29 +259,71 @@ def readInputFile(regionsFile):
     return(allRegions,regionsNames,regionsCoords,regionNameToChrom,regionNameToMultiplex,regionNameToPrimerType,regionNameToPriority)
 
 def readPrimersFile(primersFile):
-    wb=xlrd.open_workbook(primersFile)
-    ws=wb.sheet_by_index(0)
-    internalPrimers=[]
-    amplifiedRegions={}
-    for i in range(ws.nrows):
-        row=ws.row_values(i)
-        if row[0]=='':
-            break
-        if i==0:
-            # Check that input file has necessary format
-            if row[:16]!='#	Left_Primer_Seq	Right_Primer_Seq	Amplicon_Name	Chrom	Amplicon_Start	Amplicon_End	Amplicon_Length	Amplified_Block_Start	Amplified_Block_End	Left_Primer_Tm	Right_Primer_Tm	Left_Primer_Length	Right_Primer_Length	Left_GC	Right_GC'.split('\t'):
-                print('ERROR! Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
-                logger.error('Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
-                exit(5)
-            continue
-        # Make chromosome from excel cell
-        chrom=getChrNum(row[4])
-        if chrom not in amplifiedRegions.keys():
-            amplifiedRegions[chrom]=set(range(int(row[8]),int(row[9])+1))
-        else:
-            amplifiedRegions[chrom].update(set(range(int(row[8]),int(row[9])+1)))
-        internalPrimers.append(row[1:16])
-    return(internalPrimers,amplifiedRegions)
+    # Detect format: TSV or legacy XLS
+    isTsv = primersFile.endswith('.tsv')
+    if not isTsv and primersFile.endswith('.xls'):
+        # Check if a TSV version exists (from _info.tsv output)
+        tsvPath = primersFile[:-4] + '.tsv'
+        # Also check for the multi-sheet naming: _info_ngs_primerplex_internal_primers.tsv
+        tsvInternal = primersFile[:-4] + '_ngs_primerplex_internal_primers.tsv'
+        if os.path.exists(tsvInternal):
+            isTsv = True
+            primersFile = tsvInternal
+        elif os.path.exists(tsvPath):
+            isTsv = True
+            primersFile = tsvPath
+    if isTsv:
+        internalPrimers=[]
+        amplifiedRegions={}
+        expectedHeader='#\tLeft_Primer_Seq\tRight_Primer_Seq\tAmplicon_Name\tChrom\tAmplicon_Start\tAmplicon_End\tAmplicon_Length\tAmplified_Block_Start\tAmplified_Block_End\tLeft_Primer_Tm\tRight_Primer_Tm\tLeft_Primer_Length\tRight_Primer_Length\tLeft_GC\tRight_GC'.split('\t')
+        with open(primersFile) as f:
+            for i,line in enumerate(f):
+                row=line.rstrip('\n').split('\t')
+                if row[0]=='':
+                    break
+                if i==0:
+                    if row[:16]!=expectedHeader:
+                        print('ERROR! Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
+                        logger.error('Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
+                        exit(5)
+                    continue
+                # Convert numeric columns
+                parsed=[]
+                for v in row:
+                    try:
+                        parsed.append(float(v))
+                    except ValueError:
+                        parsed.append(v)
+                chrom=getChrNum(parsed[4])
+                if chrom not in amplifiedRegions.keys():
+                    amplifiedRegions[chrom]=set(range(int(parsed[8]),int(parsed[9])+1))
+                else:
+                    amplifiedRegions[chrom].update(set(range(int(parsed[8]),int(parsed[9])+1)))
+                internalPrimers.append(parsed[1:16])
+        return(internalPrimers,amplifiedRegions)
+    else:
+        # Legacy XLS via xlrd
+        wb=xlrd.open_workbook(primersFile)
+        ws=wb.sheet_by_index(0)
+        internalPrimers=[]
+        amplifiedRegions={}
+        for i in range(ws.nrows):
+            row=ws.row_values(i)
+            if row[0]=='':
+                break
+            if i==0:
+                if row[:16]!='#\tLeft_Primer_Seq\tRight_Primer_Seq\tAmplicon_Name\tChrom\tAmplicon_Start\tAmplicon_End\tAmplicon_Length\tAmplified_Block_Start\tAmplified_Block_End\tLeft_Primer_Tm\tRight_Primer_Tm\tLeft_Primer_Length\tRight_Primer_Length\tLeft_GC\tRight_GC'.split('\t'):
+                    print('ERROR! Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
+                    logger.error('Input file with primers has incorrect format. You can use only files with primers that has format of NGS-primerplex')
+                    exit(5)
+                continue
+            chrom=getChrNum(row[4])
+            if chrom not in amplifiedRegions.keys():
+                amplifiedRegions[chrom]=set(range(int(row[8]),int(row[9])+1))
+            else:
+                amplifiedRegions[chrom].update(set(range(int(row[8]),int(row[9])+1)))
+            internalPrimers.append(row[1:16])
+        return(internalPrimers,amplifiedRegions)
 
 def createPrimer3_parameters(pointRegions,args,refFa,
                              designedInternalPrimers=None,
@@ -232,8 +346,8 @@ def createPrimer3_parameters(pointRegions,args,refFa,
                         'PRIMER_PAIR_WT_DIFF_TM':0.5,
                         'PRIMER_WT_GC_PERCENT_GT':0.5,
                         'PRIMER_WT_GC_PERCENT_LT':0.5,
-                        'PRIMER_PAIR_WT_PRODUCT_SIZE_GT':2,
-                        'PRIMER_PAIR_WT_PRODUCT_SIZE_LT':2,
+                        'PRIMER_PAIR_WT_PRODUCT_SIZE_GT':args.productSizeWeight,
+                        'PRIMER_PAIR_WT_PRODUCT_SIZE_LT':args.productSizeWeight,
                         'PRIMER_EXPLAIN_FLAG':1}
     primer3Params={}
     primerTags=deepcopy(templatePrimerTags)
@@ -583,7 +697,7 @@ def constructInternalPrimers(primer3Params,regionNameToChrom,
     print()
     p.close()
     p.join()
-    writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers.xls')
+    writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers.tsv')
     regionsWithoutPrimers=[]
     for curRegionName,ampls in amplNames.items():
         if len(ampls)==0:
@@ -1100,77 +1214,133 @@ def checkPrimersForUridine(leftPrimer,rightPrimer,args,
                rightPrimerWithU)
     return(False)
 
+def _draftTsvPath(rFile, suffix):
+    """Derive TSV path from draft file base path. suffix is '_draft_internal.tsv' or '_draft_external.tsv'."""
+    # Strip extension (.xls or .tsv) then add suffix
+    for ext in ('.xls', '.tsv', '_draft_internal.tsv', '_draft_external.tsv'):
+        if rFile.endswith(ext):
+            return rFile[:-len(ext)] + suffix
+    return rFile + suffix
+
+_DRAFT_HEADER = ['Primer_Pair','Left_Primer_Start','Left_Primer_Length',
+                 'Right_Primer_End','Right_Primer_Length',
+                 'Left_Primer_Tm','Right_Primer_Tm',
+                 'Amplicon_Length','Primers_Score','Chrom']
+
 def writeDraftPrimers(primersInfo,rFile,goodPrimers=None,external=False):
     # Good primers contains list of primers that correspond some defined parameters, e.g. specificity
-    # worksheet #0 - internal primers
-    # worksheet #1 - external primers
+    # Writes two TSV files: *_draft_internal.tsv and *_draft_external.tsv
+    # When external=False: writes new data to internal, preserves existing external
+    # When external=True: writes new data to external, preserves existing internal
+    internalPath = _draftTsvPath(rFile, '_draft_internal.tsv')
+    externalPath = _draftTsvPath(rFile, '_draft_external.tsv')
+
+    # Read existing data from the "other" file (the one we're not writing new data to)
     oldRows=[]
-    if os.path.exists(rFile):
-        wb=xlrd.open_workbook(rFile)
-        ws=None
-        if external:
-            ws=wb.sheet_by_index(0)
-        elif wb.nsheets>1:
-            ws=wb.sheet_by_index(1)
-        if ws:
-            for i in range(ws.nrows):
-                if i==0:
-                    continue
-                row=ws.row_values(i)
-                oldRows.append(row)
-    wbw=xls.Workbook(rFile)
     if external:
-        wsw1=wbw.add_worksheet('Draft_Internal_Primers')
-        wsw2=wbw.add_worksheet('Draft_External_Primers')
+        preservePath = internalPath
     else:
-        wsw2=wbw.add_worksheet('Draft_Internal_Primers')
-        wsw1=wbw.add_worksheet('Draft_External_Primers')
-    wsw1.write_row(0,0,['Primer_Pair','Left_Primer_Start','Left_Primer_Length',
-                        'Right_Primer_End','Right_Primer_Length',
-                        'Left_Primer_Tm','Right_Primer_Tm',
-                        'Amplicon_Length','Primers_Score','Chrom'])
-    rowNum=1
-    for row in oldRows:
-        wsw1.write_row(rowNum,0,row)
-        rowNum+=1
-    wsw2.write_row(0,0,['Primer_Pair','Left_Primer_Start','Left_Primer_Length',
-                       'Right_Primer_End','Right_Primer_Length',
-                       'Left_Primer_Tm','Right_Primer_Tm',
-                       'Amplicon_Length','Primers_Score','Chrom'])
-    rowNum=1
-    for primerPair,info in primersInfo.items():
-        if (goodPrimers==None or
-            goodPrimers and primerPair in goodPrimers):
-            wsw2.write_row(rowNum,0,[primerPair,info[0][0][0],info[0][0][1],
-                                    info[0][1][0],info[0][1][1],
-                                    info[1][0],info[1][1],
-                                    info[2],info[3],info[4]])
-            rowNum+=1
-    wbw.close()
+        preservePath = externalPath
+    if os.path.exists(preservePath):
+        with open(preservePath) as f:
+            for lineNum, line in enumerate(f):
+                if lineNum == 0:
+                    continue  # skip header
+                row = line.rstrip('\n').split('\t')
+                oldRows.append(row)
+
+    # Write preserved data
+    with open(preservePath, 'w') as f:
+        f.write('\t'.join(_DRAFT_HEADER) + '\n')
+        for row in oldRows:
+            f.write('\t'.join(str(v) for v in row) + '\n')
+
+    # Write new data
+    newPath = externalPath if external else internalPath
+    with open(newPath, 'w') as f:
+        f.write('\t'.join(_DRAFT_HEADER) + '\n')
+        for primerPair,info in primersInfo.items():
+            if (goodPrimers==None or
+                goodPrimers and primerPair in goodPrimers):
+                row = [primerPair,info[0][0][0],info[0][0][1],
+                       info[0][1][0],info[0][1][1],
+                       info[1][0],info[1][1],
+                       info[2],info[3],info[4]]
+                f.write('\t'.join(str(v) for v in row) + '\n')
+
+def _readDraftRows(draftFile, external=False):
+    """Read rows from a draft/info file. Returns list of lists (each row as list of values).
+    Supports TSV files and legacy .xls files (via xlrd)."""
+    # Determine the actual file to read
+    actualFile = draftFile
+    isTsv = False
+    # If draftFile is a TSV path or a base that maps to TSV files
+    if draftFile.endswith('.tsv'):
+        isTsv = True
+        actualFile = draftFile
+    elif draftFile.endswith('.xls'):
+        # Check if TSV versions exist
+        tsvPath = _draftTsvPath(draftFile, '_draft_external.tsv' if external else '_draft_internal.tsv')
+        if os.path.exists(tsvPath):
+            isTsv = True
+            actualFile = tsvPath
+    # Also check for _draft_internal.tsv / _draft_external.tsv based on the file path
+    if not isTsv and not draftFile.endswith('.xls'):
+        suffix = '_draft_external.tsv' if external else '_draft_internal.tsv'
+        tsvPath = _draftTsvPath(draftFile, suffix)
+        if os.path.exists(tsvPath):
+            isTsv = True
+            actualFile = tsvPath
+
+    if isTsv:
+        if not os.path.exists(actualFile):
+            print('ERROR (46)! The defined file with draft primers was not found')
+            print(actualFile)
+            exit(46)
+        rows = []
+        with open(actualFile) as f:
+            for line in f:
+                cols = line.rstrip('\n').split('\t')
+                # Convert numeric strings to float where possible (matching xlrd behavior)
+                parsed = []
+                for v in cols:
+                    try:
+                        parsed.append(float(v))
+                    except ValueError:
+                        parsed.append(v)
+                rows.append(parsed)
+        return rows
+    else:
+        # Legacy .xls file via xlrd
+        try:
+            wb=xlrd.open_workbook(draftFile)
+        except FileNotFoundError:
+            print('ERROR (46)! The defined file with draft primers was not found')
+            print(draftFile)
+            exit(46)
+        if external:
+            ws=wb.sheet_by_index(1)
+        else:
+            ws=wb.sheet_by_index(0)
+        rows = []
+        for i in range(ws.nrows):
+            rows.append(ws.row_values(i))
+        return rows
 
 def readDraftPrimers(draftFile,args,external=False):
-    try:
-        wb=xlrd.open_workbook(draftFile)
-    except FileNotFoundError:
-        print('ERROR (46)! The defined file with draft primers was not found')
-        print(draftFile)
-        exit(46)
-    if external:
-        ws=wb.sheet_by_index(1)
-    else:
-        ws=wb.sheet_by_index(0)
+    rows = _readDraftRows(draftFile, external)
     # Read info about designed primers
     primersInfo={}
     primersInfoByChrom={}
     totalDraftPrimersNum=0
     primerPairToMultiplex={}
-    showPercWork(0,ws.nrows)
+    totalRows = len(rows)
+    showPercWork(0,totalRows)
     # Stores which format does the draft-file have
     # If True, draft-file is like draft-file
     # else, it is as info-file
     draftIsDraft=False
-    for i in range(ws.nrows):
-        row=ws.row_values(i)
+    for i,row in enumerate(rows):
         if i==0:
             if row[0]=='Primer_Pair':
                 draftIsDraft=True
@@ -1182,17 +1352,6 @@ def readDraftPrimers(draftFile,args,external=False):
                 continue
             chromInt=nameToNum[chrom]
             totalDraftPrimersNum+=1
-            # Checking that this primer pair doesn't form secondary structures
-            # checkPrimersFir uses the following arguments:
-            # primers,primersToCompare,
-            # minmultdimerdg1=-6,minmultdimerdg2=-10,
-            # maxIntersectionOfPrimers=5,
-            # unspecificPrimers=[],
-            # mv_conc=50,dv_conc=3,
-            # dntp_conc=0.8,dna_conc=250,
-            # leftAdapter=None,rightAdapter=None)
-            # primers arguments have the following format:
-            # leftPrimer,rightPrimer,chrom,amplStart,amplEnd
             leftPrimer=row[0].split('_')[0].upper().replace('U','T')
             rightPrimer=row[0].split('_')[1].upper().replace('U','T')
             result=checkPrimersFit([leftPrimer,rightPrimer,str(chrom),int(row[1]),int(row[3])],
@@ -1225,18 +1384,6 @@ def readDraftPrimers(draftFile,args,external=False):
                 continue
             chromInt=nameToNum[chrom]
             totalDraftPrimersNum+=1
-            # Checking that this primer pair doesn't form secondary structures
-            # checkPrimersFir uses the following arguments:
-            # primers,primersToCompare,
-            # minmultdimerdg1=-6,minmultdimerdg2=-10,
-            # maxIntersectionOfPrimers=5,
-            # unspecificPrimers=[],
-            # mv_conc=50,dv_conc=3,
-            # dntp_conc=0.8,dna_conc=250,
-            # leftAdapter=None,rightAdapter=None)
-            # primers arguments have the following format:
-            # leftPrimer,rightPrimer,chrom,amplStart,amplEnd
-            # Replace U to T
             leftPrimer=row[1].upper().replace('U','T')
             rightPrimer=row[2].upper().replace('U','T')
             result=checkPrimersFit([leftPrimer,rightPrimer,str(chrom),int(row[5]),int(row[6])],
@@ -1264,13 +1411,7 @@ def readDraftPrimers(draftFile,args,external=False):
                 primersInfoByChrom[chromInt][primerPair]=[[int(row[5]),int(row[12])],[int(row[6]),int(row[13])]]
             if row[17]!='' and row[17]!=' ':
                 primerPairToMultiplex[primerPair]=int(row[17])
-##                if int(row[17]) not in readyMultiplexesDict.keys():
-##                    readyMultiplexesDict[int(row[17])]=[]
-##                readyMultiplexesDict[int(row[17])].append(primerPair)
-##            for poolNum,primers in sorted(readyMultiplexesDict.items(),
-##                                          key=lambda item:item[0]):
-##                readyMultiplexes.append(primers)
-        showPercWork(i+1,ws.nrows)
+        showPercWork(i+1,totalRows)
     print()
     return(primersInfo,primersInfoByChrom,totalDraftPrimersNum,primerPairToMultiplex)
 
@@ -1417,7 +1558,7 @@ def getRegionsUncoveredByDraftExternalPrimers(primersInfo,primersInfoByChrom,out
 ##    # Write all primers and for primers ]
 ##    # which give unspecific primers we write primer
 ##    # with which it form this product
-##    wbw=xls.Workbook(rFile)
+##    wbw=TsvWorkbook(rFile)
 ##    if external:
 ##        wsw1=wbw.add_worksheet('Draft_Internal_Primers')
 ##        wsw2=wbw.add_worksheet('Draft_External_Primers')
@@ -1581,9 +1722,9 @@ def checkPrimersSpecificity(inputFileBase,primersInfo,primersToAmplNames,
         varNum='_'+varNum
     if not external:
         # This file includes specificity information about all primers including those one that were not included to any output combination
-        wbw_spec=xls.Workbook(inputFileBase+runName+'_all_internal_primers_specificity.xls')
+        wbw_spec=TsvWorkbook(inputFileBase+runName+'_all_internal_primers_specificity.tsv')
     else:
-        wbw_spec=xls.Workbook(inputFileBase+runName+'_external_primers'+varNum+'_specificity.xls')
+        wbw_spec=TsvWorkbook(inputFileBase+runName+'_external_primers'+varNum+'_specificity.tsv')
     # Add worksheet for the number of nontargets for primer
     wsw_spec=wbw_spec.add_worksheet('Primers_specificity')
     wsw_spec.write_row(0,0,['Primer','Number_of_Nonspecific_regions'])
@@ -2032,47 +2173,38 @@ def checkPrimerForCrossingSNP(poolArgs):
         hfSnpFound=True
     return(primer,hfSnpFound)
 
-# joinAmpliconsToAmplifiedBlocks joins neighbourhing or overlapping amplicons to blocks
-# Minimal path is a path of one primer:
-## [coord1,primer_name,coord2]
-# chrom here is a chromosome number
-def joinAmpliconsToBlocks(poolArgs):
-    chromRegionsCoords,chromPrimersInfoByChrom,primersInfo,maxAmplLen,optPrimerLen,chromInt,returnVariantsNum,args=poolArgs
-    chrom=numToName[chromInt]
-    # First, split all regions on this chromosome onto blocks, elements of which cannot be joined into one amplificated block
+# Phase A: Build block structures for a chromosome
+def _buildChromBlocks(chromRegionsCoords,maxAmplLen):
     blocks=[[chromRegionsCoords[0]]]
-    coordToBlock={} # converts coordinate into the number of block
+    coordToBlock={}
     for coord in chromRegionsCoords[1:]:
         if coord>=blocks[-1][-1]+maxAmplLen*2:
             blocks.append([coord])
         else:
             blocks[-1].append(coord)
         coordToBlock[coord]=len(blocks)-1
-    logger.info('Chromosome '+str(chrom)+' was splitted onto '+str(len(blocks))+' distinct blocks')
-    firstNodes=[]
-    lastNodes=[]
-    blockGraphs=[]
-    for block in blocks:
-        # Making graphs for each chromosome
-        blockGraphs.append(nx.Graph())
-        # Get the first and the last input positions on this chromosome
-        firstNodes.append(block[0])
-        lastNodes.append(block[-1])
-    # Stores pairs of primer pairs that overlap and form very strong primer dimers
-    # {primerPair1:[primerPair2,primerPair3...]}
-    primerPairPairsFormingDimers={}
-    # Add first mutation as the first node and search for primer pairs that cover it
-    ## Also for each primer pair we search for primer pairs that cover the next input position
-    ### For each edge we add weight, that describes farness from that edge
+    firstNodes=[block[0] for block in blocks]
+    lastNodes=[block[-1] for block in blocks]
+    return blocks,coordToBlock,firstNodes,lastNodes
+
+# Phase B: Pairwise primer comparison for a chunk of outer-loop indices (parallelizable)
+def _comparePrimersChunk(poolArgs):
+    (sortedChromPrimers,startIdx,endIdx,chromRegionsCoords,
+     blocks,coordToBlock,firstNodes,lastNodes,maxAmplLen,args)=poolArgs
+    # edges: (blockNum, node1, node2, weight) for tiling edges
+    edges=[]
+    # first_last_edges: (blockNum, source, target) for firstNode/lastNode/end edges
+    first_last_edges=[]
+    # dimers: {pairName1: set(pairName2, ...)}
+    dimers={}
     comparisonNum=0
-    for i,(primerPairName1,primers1) in enumerate(sorted(chromPrimersInfoByChrom.items(),
-                                                         key=lambda item:(item[1][0][0],
-                                                                          item[1][1][0]))):
+    for i in range(startIdx,endIdx):
+        primerPairName1,primers1=sortedChromPrimers[i]
         primerName1,primerName2=primerPairName1.split('_')
         amplBlockStart1=primers1[0][0]+primers1[0][1]
         amplBlockEnd1=primers1[1][0]-primers1[1][1]
         # Get block number
-        coords=deepcopy(chromRegionsCoords)
+        coords=list(chromRegionsCoords)
         coords.append(amplBlockStart1)
         amplBlockStart1_num=sorted(coords).index(amplBlockStart1)
         if amplBlockStart1_num==0:
@@ -2080,55 +2212,55 @@ def joinAmpliconsToBlocks(poolArgs):
         elif amplBlockStart1_num==len(chromRegionsCoords):
             blockNum=len(blocks)-1
         else:
-            nextMut=chromRegionsCoords[amplBlockStart1_num]
-            blockNum=coordToBlock[nextMut]
+            nextMut_block=chromRegionsCoords[amplBlockStart1_num]
+            blockNum=coordToBlock[nextMut_block]
         firstMut=False
         lastMut=False
         firstNode=firstNodes[blockNum]
         lastNode=lastNodes[blockNum]
-        blockGraph=blockGraphs[blockNum]
         # If first mutation is covered by this primers pair, we save edge
         if amplBlockStart1<=firstNode<=amplBlockEnd1:
-            blockGraph.add_edge(firstNode,primerPairName1)
+            first_last_edges.append((blockNum,firstNode,primerPairName1))
             firstMut=True
             firstMutNum1=firstNode
         if amplBlockStart1<=lastNode<=amplBlockEnd1:
-            blockGraph.add_edge(lastNode,primerPairName1)
+            first_last_edges.append((blockNum,lastNode,primerPairName1))
             lastMut=True
             lastMutNum1=lastNode
         if lastMut and firstMut:
-            blockGraph.add_edge('end',primerPairName1)
+            first_last_edges.append((blockNum,'end',primerPairName1))
             continue
         # Get index of the last mutation that is covered by this primers pair
-        ## Extract the last position of amplBlock, insert it to list and get index
         if amplBlockEnd1 in blocks[blockNum]:
             lastMutNum1=sorted(blocks[blockNum]).index(amplBlockEnd1)
         else:
-            coords=deepcopy(blocks[blockNum])
+            coords=list(blocks[blockNum])
             coords.append(amplBlockEnd1)
             lastMutNum1=sorted(coords).index(amplBlockEnd1)-1
         if amplBlockStart1 in blocks[blockNum]:
             firstMutNum1=sorted(blocks[blockNum]).index(amplBlockStart1)
         else:
-            coords=deepcopy(blocks[blockNum])
+            coords=list(blocks[blockNum])
             coords.append(amplBlockStart1)
             firstMutNum1=sorted(coords).index(amplBlockStart1)
         nextMutNotCovered=True
         prevMutNotCovered=True
-        for primerPairName2,primers2 in sorted(chromPrimersInfoByChrom.items(),
-                                               key=lambda item:(item[1][0][0],
-                                                                item[1][1][0]))[i+1:]:
+        for j in range(i+1,len(sortedChromPrimers)):
+            primerPairName2,primers2=sortedChromPrimers[j]
             if primerPairName1==primerPairName2:
                 continue
             primerName3,primerName4=primerPairName2.split('_')
             comparisonNum+=1
             amplBlockStart2=primers2[0][0]+primers2[0][1]
             amplBlockEnd2=primers2[1][0]-primers2[1][1]
+            # Early termination: if primer pair 2 starts too far past primer pair 1,
+            # no overlap, no edge, and no dimer relevance possible
+            if amplBlockStart2>amplBlockEnd1+maxAmplLen*2:
+                break
             nextMut=blocks[blockNum][min(lastMutNum1+1,len(blocks[blockNum])-1)]
             prevMut=blocks[blockNum][max(firstMutNum1-1,0)]
             mayFormDimer=False
             if amplBlockStart2-2>amplBlockEnd1:
-                # amplBlockEnd1>=amplStart2
                 if (amplBlockEnd1+2>=primers2[0][0] and
                     amplBlockStart2<=primers1[1][0]+2):
                     if args.leftAdapter and args.rightAdapter:
@@ -2138,8 +2270,6 @@ def joinAmpliconsToBlocks(poolArgs):
                                                     dv_conc=args.dvConc,
                                                     dna_conc=args.primerConc,
                                                     dntp_conc=args.dntpConc).dg/1000
-##                        dG=calcThreeStrikeEndDimer(args.rightAdapter+primerName2,
-##                                                   args.leftAdapter+primerName3)
                     else:
                         dG1=primer3.calcHeterodimer(primerName2,
                                                     primerName3,
@@ -2147,8 +2277,6 @@ def joinAmpliconsToBlocks(poolArgs):
                                                     dv_conc=args.dvConc,
                                                     dna_conc=args.primerConc,
                                                     dntp_conc=args.dntpConc).dg/1000
-##                        dG=calcThreeStrikeEndDimer(primerName2,
-##                                                   primerName3)
                     if dG1<=args.minMultDimerdG2:
                         if 178916000<=amplBlockStart2<=178917000:
                             print('WARNING: The follwowing primers form stable dimer:')
@@ -2156,25 +2284,46 @@ def joinAmpliconsToBlocks(poolArgs):
                                   args.leftAdapter,primerName3)
                         mayFormDimer=True
             if mayFormDimer:
-                if primerPairName1 not in primerPairPairsFormingDimers.keys():
-                    primerPairPairsFormingDimers[primerPairName1]=set()
-                primerPairPairsFormingDimers[primerPairName1].add(primerPairName2)
+                if primerPairName1 not in dimers:
+                    dimers[primerPairName1]=set()
+                dimers[primerPairName1].add(primerPairName2)
             if (not lastMut and
                 amplBlockStart2<=nextMut<=amplBlockEnd2 and
-                 amplBlockEnd1<amplBlockStart2+args.maxoverlap):                
+                 amplBlockEnd1<amplBlockStart2+args.maxoverlap):
                 if not mayFormDimer:
-                    # Calculate weight of this edge - distance between amplicons
-                    weight=maxAmplLen-min(50,primers2[0][0]-primers1[1][0]) # if distance is too large (>50), leave it as 50
-                    blockGraph.add_edge(primerPairName1,primerPairName2,weight=weight)
+                    weight=maxAmplLen-min(50,primers2[0][0]-primers1[1][0])
+                    edges.append((blockNum,primerPairName1,primerPairName2,weight))
                     nextMutNotCovered=False
             elif (not firstMut and
                   amplBlockStart2<=prevMut<=amplBlockEnd2 and
-		  amplBlockEnd2<amplBlockStart1+args.maxoverlap):
+                  amplBlockEnd2<amplBlockStart1+args.maxoverlap):
                 if not mayFormDimer:
-                    # Calculate weight of this edge - distance between amplicons
-                    weight=maxAmplLen-min(50,primers1[0][0]-primers2[1][0]) # if distance is too large (>50), leave it as 50
-                    blockGraph.add_edge(primerPairName1,primerPairName2,weight=weight)
+                    weight=maxAmplLen-min(50,primers1[0][0]-primers2[1][0])
+                    edges.append((blockNum,primerPairName1,primerPairName2,weight))
                     prevMutNotCovered=False
+    return edges,first_last_edges,dimers,comparisonNum
+
+# Phase C: Merge chunk results, build graphs, find paths
+def _findBlockPaths(chromInt,blocks,firstNodes,lastNodes,
+                    chunkResults,primersInfo,args,
+                    chromPrimersInfoByChrom=None,chromRegionsCoords=None):
+    chrom=numToName[chromInt]
+    returnVariantsNum=args.returnVariantsNum
+    # Build block graphs from merged chunk results
+    blockGraphs=[nx.Graph() for _ in blocks]
+    primerPairPairsFormingDimers={}
+    totalComparisons=0
+    for chunk_edges,chunk_first_last,chunk_dimers,chunk_compNum in chunkResults:
+        totalComparisons+=chunk_compNum
+        for blockNum,source,target in chunk_first_last:
+            blockGraphs[blockNum].add_edge(source,target)
+        for blockNum,node1,node2,weight in chunk_edges:
+            blockGraphs[blockNum].add_edge(node1,node2,weight=weight)
+        for pairName1,pairName2Set in chunk_dimers.items():
+            if pairName1 not in primerPairPairsFormingDimers:
+                primerPairPairsFormingDimers[pairName1]=set()
+            primerPairPairsFormingDimers[pairName1].update(pairName2Set)
+    logger.info('Chromosome '+str(chrom)+': '+str(totalComparisons)+' pairwise comparisons')
     blocksFinalShortestPaths=[]
     leftGoodPrimers=[]
     for i,blockGraph in enumerate(blockGraphs):
@@ -2225,7 +2374,7 @@ def joinAmpliconsToBlocks(poolArgs):
                             for node in blockGraph.nodes():
                                 leftGoodPrimers.append(node)
                         writeDraftPrimers(primersInfo,
-                                          args.regionsFile[:-4]+'_all_draft_primers_after_joinment.xls',
+                                          args.regionsFile[:-4]+'_all_draft_primers_after_joinment.tsv',
                                           leftGoodPrimers)
                         print('ERROR (63)! Some primers forming strong primer-dimers were removed and other primers were written "into *_draft_primers_after_joinment". '
                               'Restart the program with this file in the -draft parameter and with increase of -primernum parameter')
@@ -2308,8 +2457,16 @@ def joinAmpliconsToBlocks(poolArgs):
             maxAnalysisVars=returnVariantsNum*2
             analysisNum=0
             weightOff=False
+            # Hard limit on total paths enumerated (including dimer-containing ones)
+            # to prevent combinatorial explosion with high --primers-number1 values
+            MAX_PATH_ENUMERATION=100000
+            totalPathsChecked=0
             try:
                 for path in nx.shortest_simple_paths(blockGraph,firstNodes[i],lastNodes[i]):
+                    totalPathsChecked+=1
+                    if totalPathsChecked>MAX_PATH_ENUMERATION:
+                        logger.warning('Block '+str(i)+' on chromosome '+str(chrom)+': reached path enumeration limit ('+str(MAX_PATH_ENUMERATION)+') - using best '+str(len(shortestPaths))+' paths found so far')
+                        break
                     # Check that all primer pairs do not form strong primer dimers
                     containPrimerPairsWithDimers=False
                     for node in path[1:-1]:
@@ -3283,9 +3440,9 @@ def splitNameForSorting(name):
     newValues=[]
     for val in values:
         try:
-            newValues.append(int(val))
+            newValues.append((0,int(val),''))
         except ValueError:
-            newValues.append(val)
+            newValues.append((1,0,val))
     return(newValues)
 
 # Section of input arguments
@@ -3331,6 +3488,13 @@ par.add_argument('--optimal-amplicon-length','-optampllen',
                  dest='optAmplLen',type=int,
                  help='optimal length of amplicons. Default: 110',
                  required=False,default=110)
+par.add_argument('--product-size-weight','-productsizewt',
+                 dest='productSizeWeight',type=float,
+                 help='penalty weight for amplicon size deviation from optimal. '
+                      'Higher values force sizes closer to optimal. '
+                      'Lower values (e.g. 0.1) allow more size variation, '
+                      'giving primer3 more positional freedom. Default: 2.0',
+                 required=False,default=2.0)
 par.add_argument('--min-primer-length','-minprimerlen',
                  dest='minPrimerLen',type=int,
                  help='minimal length of primers. Default: 16',
@@ -3668,14 +3832,14 @@ if args.primersFile:
     # If user wants to automatically sort primers pairs into multiplex reactions
     ## We create file for storing all problematic pairs of primer pairs
     if len(regionNameToMultiplex)>0:
-        multiplexProblemsWB=xls.Workbook(args.primersFile[:-4]+'_amplicons_multiplex_incompatibility.xls')
+        multiplexProblemsWB=TsvWorkbook(args.primersFile[:-4]+'_amplicons_multiplex_incompatibility.tsv')
         mpws=multiplexProblemsWB.add_worksheet('Internal_Primers')
         mpws.write_row(0,0,['Primers_Pair1','Primers_Pair2','Problem while joining to one multiplex'])
         colsWidth=[40,40,20]
         for k,colsWidth in enumerate(colsWidth):
             mpws.set_column(k,k,colsWidth)
     mpwsRowNum=1
-    wbw=xls.Workbook(args.primersFile[:-4]+'_with_external_primers.xls')
+    wbw=TsvWorkbook(args.primersFile[:-4]+'_with_external_primers.tsv')
     wsw1=wbw.add_worksheet('NGS_Primerplex_Internal_Primers')
     wsw1.write_row(0,0,['#','Left_Primer_Seq','Right_Primer_Seq','Amplicon_Name','Chrom','Amplicon_Start','Amplicon_End','Amplicon_Length',
                        'Amplified_Block_Start','Amplified_Block_End','Left_Primer_Tm','Right_Primer_Tm','Left_Primer_Length','Right_Primer_Length','Left_GC','Right_GC','Desired_Multiplex','Designed_Multiplex'])
@@ -3846,7 +4010,7 @@ if args.primersFile:
     p.close()
     p.join()
     writeDraftPrimers(extPrimersInfo,
-                      args.regionsFile[:-4]+'_all_draft_primers.xls',
+                      args.regionsFile[:-4]+'_all_draft_primers.tsv',
                       external=True)
     # Analyzing external primers specificity        
     if args.doBlast:
@@ -3859,7 +4023,7 @@ if args.primersFile:
         logger.info(' # Number of specific external primer pairs: '+str(len(specificPrimers))+'. Unspecific pairs will be removed.')
         # Write primers that left after filtering by specificity
         writeDraftPrimers(extPrimersInfo,
-                          args.regionsFile[:-4]+'_all_draft_primers_after_specificity.xls',
+                          args.regionsFile[:-4]+'_all_draft_primers_after_specificity.tsv',
                           goodPrimers=specificPrimers,
                           external=True)
     # Check external primers for covering high-frequent SNPs
@@ -3875,7 +4039,7 @@ if args.primersFile:
         logger.info(" # Number of primers covering high-frequent SNPs: "+str(len(primersCoveringSNPs))+'. They will be removed.')
         # Write primers that left after filtering by SNPs
         writeDraftPrimers(extPrimersInfo,
-                          args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.xls',
+                          args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.tsv',
                           goodPrimers=primerPairsNonCoveringSNPs,
                           external=True)
     # Now we need to remove unspecific primer pairs
@@ -4044,6 +4208,41 @@ else:
         logger.info(' # Number of primer pairs from draft file: '+str(totalDraftPrimersNum))
         print(' # That do not form secondary structures: '+str(len(primersInfo)))
         logger.info(' # That do not form secondary structures: '+str(len(primersInfo)))
+        # Auto-remove draft primers for priority-0 (force-include) regions
+        # so they get redesigned from scratch with full primer3 candidate pool
+        forceIncludeRegionCoords={}
+        for chrom,regions in allRegions.items():
+            for regionName,regionData in regions.items():
+                if regionNameToPriority.get(regionName,1)==0:
+                    chromInt=nameToNum[chrom]
+                    if chromInt not in forceIncludeRegionCoords:
+                        forceIncludeRegionCoords[chromInt]=[]
+                    forceIncludeRegionCoords[chromInt].append((regionData[1],regionData[2],regionName))
+        if forceIncludeRegionCoords:
+            removedPairs=set()
+            for chromInt,regionList in forceIncludeRegionCoords.items():
+                if chromInt not in primersInfoByChrom:
+                    continue
+                for primerPair,coord in list(primersInfoByChrom[chromInt].items()):
+                    amplStart=coord[0][0]+coord[0][1]
+                    amplEnd=coord[1][0]-coord[1][1]
+                    for regStart,regEnd,regName in regionList:
+                        if amplStart<=regStart and amplEnd>=regEnd:
+                            removedPairs.add(primerPair)
+                            break
+                        if regStart==regEnd and amplStart<=regStart<=amplEnd:
+                            removedPairs.add(primerPair)
+                            break
+            for pp in removedPairs:
+                primersInfo.pop(pp,None)
+                primerPairToMultiplex.pop(pp,None)
+                for chromInt in primersInfoByChrom:
+                    primersInfoByChrom[chromInt].pop(pp,None)
+            if removedPairs:
+                print(' # Auto-removed '+str(len(removedPairs))+' draft primer pair(s) covering priority-0 (force-include) regions for redesign')
+                logger.info(' # Auto-removed '+str(len(removedPairs))+' draft primer pair(s) covering priority-0 (force-include) regions for redesign')
+                for pp in sorted(removedPairs):
+                    logger.info('   Removed: '+pp)
 ##        if not args.skipUndesigned:
         # Get regions that uncovered by already designed primers
         print('Getting positions that uncovered by draft primers...')
@@ -4094,7 +4293,7 @@ else:
         logger.info(' Removing unspecific primer pairs...')
         primersInfoByChrom,primersInfo,amplNames=removeBadPrimerPairs(primersInfoByChrom,primersInfo,specificPrimers,primersToAmplNames,amplNames)
         # Write primers that left after filtering by specificity
-        writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_specificity.xls',specificPrimers)
+        writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_specificity.tsv',specificPrimers)
         # If we filtered primers out by specificity, we need to check that all input regions are still covered
         amplNames,allRegions,regionNameToChrom,regionsCoords=checkThatAllInputRegionsCovered(amplNames,allRegions,regionNameToChrom,regionsCoords,'by specificity',args.skipUndesigned)
         # If user wants to automatically sort amplicons by multiplexes
@@ -4127,11 +4326,11 @@ else:
             logger.info(" Removing primer pairs covering high-frequent SNPs...")
             primersInfoByChrom,primersInfo,amplNames=removeBadPrimerPairs(primersInfoByChrom,primersInfo,primerPairsNonCoveringSNPs,primersToAmplNames,amplNames)
             # Write primers that left after filtering by covering SNPs
-            writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.xls',primerPairsNonCoveringSNPs)
+            writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.tsv',primerPairsNonCoveringSNPs)
             # If we filtered primers out that cover SNPs, we need to check that all input regions are still covered
             amplNames,allRegions,regionNameToChrom,regionsCoords=checkThatAllInputRegionsCovered(amplNames,allRegions,regionNameToChrom,regionsCoords,'that cover SNPs',args.skipUndesigned)
         else:
-            writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.xls',primerPairsNonCoveringSNPs)
+            writeDraftPrimers(primersInfo,args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.tsv',primerPairsNonCoveringSNPs)
 
     # Now we need to group primers into continuous amplified blocks
     # amplified block contains all multiplexes for ditinct joined regions
@@ -4142,23 +4341,12 @@ else:
     # We go through all chromosomes
     print('Joining primer pairs to amplified blocks...')
     logger.info('Joining primer pairs to amplified blocks...')
-##    p=ThreadPool(args.threads)
-    p=Pool(args.threads)
-##    results=[]
-    poolArgs=[]
-    wholeWork=0
+    # Phase A: Build block structures for all chromosomes (fast, sequential)
+    chromBlockData={}
     for chromInt in sorted(regionsCoords.keys()):
         chrom=numToName[chromInt]
         try:
-            poolArgs.append((sorted(regionsCoords[chromInt]),
-                             primersInfoByChrom[chromInt],primersInfo,
-                             args.maxAmplLen,args.optPrimerLen,
-			     chromInt,args.returnVariantsNum,
-                             args))        
-##            results.append(p.apply_async(joinAmpliconsToBlocks,(sorted(regionsCoords[chromInt]),
-##                                                                primersInfoByChrom[chromInt],
-##                                                                args.maxAmplLen,chromInt,
-##                                                                args.returnVariantsNum)))
+            chromPrimers=primersInfoByChrom[chromInt]
         except KeyError:
             if args.skipUndesigned:
                 print('WARNING: Chromosome '+str(chrom)+' ('+str(chromInt)+') has no valid primer pairs after filtering - skipping')
@@ -4171,28 +4359,60 @@ else:
             logger.error('Chromosome as number: '+str(chromInt))
             logger.error('Chromosome as string: '+str(chrom))
             exit(60)
-        wholeWork+=1
-    doneWork=0
-##    wholeWork=len(results)
-    if len(poolArgs)==0:
+        sortedPrimers=sorted(chromPrimers.items(),key=lambda item:(item[1][0][0],item[1][1][0]))
+        chromRegionsSorted=sorted(regionsCoords[chromInt])
+        cBlocks,cCoordToBlock,cFirstNodes,cLastNodes=_buildChromBlocks(chromRegionsSorted,args.maxAmplLen)
+        logger.info('Chromosome '+str(chrom)+' was splitted onto '+str(len(cBlocks))+' distinct blocks')
+        chromBlockData[chromInt]={'sortedPrimers':sortedPrimers,
+                                  'chromRegionsSorted':chromRegionsSorted,
+                                  'blocks':cBlocks,'coordToBlock':cCoordToBlock,
+                                  'firstNodes':cFirstNodes,'lastNodes':cLastNodes,
+                                  'chromPrimers':chromPrimers}
+    if len(chromBlockData)==0:
         print('ERROR (61)! No primers left after filtering!')
         logger.error('No primers left after filtering!')
         exit(61)
+    # Phase B: Create comparison chunks across all chromosomes, run in parallel
+    COMPARISON_CHUNK_SIZE=2000
+    comparisonChunks=[]
+    chromToChunkIndices={}
+    for chromInt,data in sorted(chromBlockData.items()):
+        n=len(data['sortedPrimers'])
+        chromToChunkIndices[chromInt]=[]
+        for start in range(0,n,COMPARISON_CHUNK_SIZE):
+            end=min(start+COMPARISON_CHUNK_SIZE,n)
+            chromToChunkIndices[chromInt].append(len(comparisonChunks))
+            comparisonChunks.append((data['sortedPrimers'],start,end,
+                                     data['chromRegionsSorted'],
+                                     data['blocks'],data['coordToBlock'],
+                                     data['firstNodes'],data['lastNodes'],
+                                     args.maxAmplLen,args))
+    logger.info('Created '+str(len(comparisonChunks))+' comparison chunks across '+str(len(chromBlockData))+' chromosomes')
+    p=Pool(args.threads)
+    chunkResults=p.map(_comparePrimersChunk,comparisonChunks)
+    p.close()
+    p.join()
+    # Phase C: Merge chunk results and find paths per chromosome (sequential)
+    wholeWork=len(chromBlockData)
+    doneWork=0
     showPercWork(doneWork,wholeWork,args.gui)
     allLeftGoodPrimers=[]
-    for res in p.imap_unordered(joinAmpliconsToBlocks,
-                                poolArgs):#results:
-        chromInt,finalShortestPaths,leftGoodPrimers=res#.get()
-        if (chromInt==None and
-            type(finalShortestPaths)==int):
-            p.close()
+    for chromInt,data in sorted(chromBlockData.items()):
+        indices=chromToChunkIndices[chromInt]
+        chromChunkResults=[chunkResults[i] for i in indices]
+        res=_findBlockPaths(chromInt,data['blocks'],data['firstNodes'],data['lastNodes'],
+                            chromChunkResults,primersInfo,args,
+                            chromPrimersInfoByChrom=data['chromPrimers'],
+                            chromRegionsCoords=data['chromRegionsSorted'])
+        chromInt_r,finalShortestPaths,leftGoodPrimers=res
+        if (chromInt_r==None and type(finalShortestPaths)==int):
             exit(finalShortestPaths)
         allLeftGoodPrimers.extend(leftGoodPrimers)
         allRegionsAmplifiedBlocks[chromInt]=finalShortestPaths
         doneWork+=1
         showPercWork(doneWork,wholeWork,args.gui)
     writeDraftPrimers(primersInfo,
-                      args.regionsFile[:-4]+'_all_draft_primers_after_joinment.xls',
+                      args.regionsFile[:-4]+'_all_draft_primers_after_joinment.tsv',
                       allLeftGoodPrimers)
     # Filter out empty blocks (from --skip-uncovered) before statistics and combination selection
     for chromInt in list(allRegionsAmplifiedBlocks.keys()):
@@ -4246,7 +4466,7 @@ else:
         outputInternalPrimers={}
         rFile=open(inputFileBase+runName+'_primers_combination_'+str(i+1)+'.fa','w')
         rInternalFile=open(inputFileBase+runName+'_primers_combination_'+str(i+1)+'_internal_amplicons.fa','w')
-        wbw=xls.Workbook(inputFileBase+runName+'_primers_combination_'+str(i+1)+'_info.xls')
+        wbw=TsvWorkbook(inputFileBase+runName+'_primers_combination_'+str(i+1)+'_info.tsv')
         wsw1=wbw.add_worksheet('NGS_Primerplex_Internal_Primers')
         wsw1.write_row(0,0,['#','Left_Primer_Seq','Right_Primer_Seq','Amplicon_Name','Chrom','Amplicon_Start','Amplicon_End','Amplicon_Length',
                            'Amplified_Block_Start','Amplified_Block_End','Left_Primer_Tm','Right_Primer_Tm','Left_Primer_Length','Right_Primer_Length','Left_GC','Right_GC','Desired_Multiplex','Designed_Multiplex'])
@@ -4255,7 +4475,7 @@ else:
         # If user wants to automatically sort primers pairs by multiplexes
         ## We create file for storing all problematic pairs of primers pairs
         if len(regionNameToMultiplex)>0:
-            multiplexProblemsWB=xls.Workbook(inputFileBase+runName+'_primers_combination_'+str(i+1)+'_amplicons_multiplex_incompatibility.xls')
+            multiplexProblemsWB=TsvWorkbook(inputFileBase+runName+'_primers_combination_'+str(i+1)+'_amplicons_multiplex_incompatibility.tsv')
             mpws=multiplexProblemsWB.add_worksheet('Internal_Primers')
             mpws.write_row(0,0,['Primers_Pair1','Primers_Pair2','Problem while joining to one multiplex',
                                 'Primer_Pair1_Mult','Primer_Pair2_Mult'])
@@ -4623,7 +4843,7 @@ else:
                 p.close()
                 p.join()
             writeDraftPrimers(extPrimersInfo,
-                              args.regionsFile[:-4]+'_all_draft_primers.xls',
+                              args.regionsFile[:-4]+'_all_draft_primers.tsv',
                               external=True)
             # Analyzing external primers specificity        
             if args.doBlast:
@@ -4636,7 +4856,7 @@ else:
                 logger.info(' # Number of specific external primer pairs: '+str(len(specificPrimers))+'. Unspecific pairs will be removed.')
                 # Write primers that left after filtering by specificity
                 writeDraftPrimers(extPrimersInfo,
-                                  args.regionsFile[:-4]+'_all_draft_primers_after_specificity.xls',
+                                  args.regionsFile[:-4]+'_all_draft_primers_after_specificity.tsv',
                                   goodPrimers=specificPrimers,
                                   external=True)
             # Check external primers for covering high-frequent SNPs
@@ -4652,7 +4872,7 @@ else:
                 logger.info(" # Number of primers covering high-frequent SNPs: "+str(len(primersCoveringSNPs))+'. They will be removed.')
                 # Write primers that left after filtering by SNPs
                 writeDraftPrimers(extPrimersInfo,
-                                  args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.xls',
+                                  args.regionsFile[:-4]+'_all_draft_primers_after_SNPs.tsv',
                                   goodPrimers=primerPairsNonCoveringSNPs,
                                   external=True)
 ##            print(outputExternalPrimers)

@@ -13,12 +13,44 @@
 import os
 import argparse
 import sys
-import xlrd
 import subprocess as sp
 
 thisDir=os.path.dirname(os.path.realpath(__file__))+os.sep
 
 # Section of functions
+def _readTsvRows(fileName):
+    """Read TSV file and return list of rows (each row is a list of values)."""
+    rows=[]
+    with open(fileName) as f:
+        for line in f:
+            cols=line.rstrip('\n').split('\t')
+            parsed=[]
+            for v in cols:
+                try:
+                    parsed.append(float(v))
+                except ValueError:
+                    parsed.append(v)
+            rows.append(parsed)
+    return rows
+
+def _findTsvFiles(baseName):
+    """Find TSV file(s) for a given base name. Returns list of file paths."""
+    # Try direct path
+    if os.path.exists(baseName):
+        return [baseName]
+    # Try stripping .xls and looking for .tsv
+    if baseName.endswith('.xls'):
+        base=baseName[:-4]
+        # Single-sheet TSV
+        if os.path.exists(base+'.tsv'):
+            return [base+'.tsv']
+        # Multi-sheet: look for *_ngs_primerplex_internal_primers.tsv etc.
+        import glob
+        matches=sorted(glob.glob(base+'_*.tsv'))
+        if matches:
+            return matches
+    return [baseName]  # Return original, will fail with clear error
+
 def checkExcelFile(fileName,
                    expectedRowNums,
                    expectedColNums,
@@ -26,30 +58,30 @@ def checkExcelFile(fileName,
                    emptyCells=None,
                    badPrimers=None,
                    badFilter=None):
-    # Checking the main output file
-    wb=xlrd.open_workbook(fileName)
-    for j in range(wb.nsheets):
+    # Checking the main output file — supports TSV files
+    files=_findTsvFiles(fileName)
+    for j,tsvFile in enumerate(files):
         if j+1>expectedSheetNums:
             break
-        ws=wb.sheet_by_index(j)
+        rows=_readTsvRows(tsvFile)
+        nrows=len(rows)
         if ((type(expectedRowNums[j])==list and
-             ws.nrows not in list(range(expectedRowNums[j][0],
+             nrows not in list(range(expectedRowNums[j][0],
                                         expectedRowNums[j][-1]+1))) or
             (type(expectedRowNums[j])==int and
-             ws.nrows!=expectedRowNums[j])):
+             nrows!=expectedRowNums[j])):
             print('Finished successfully '
                   'but the output contains incorrect number of rows:')
-            print(fileName)
+            print(tsvFile)
             print('The index of the worksheet:',j+1)
             print('The expected number of rows:',expectedRowNums[j])
-            print('The obtained number of rows:',ws.nrows)
+            print('The obtained number of rows:',nrows)
             exit(11)
-        for i in range(ws.nrows):
-            row=ws.row_values(i)
+        for i,row in enumerate(rows):
             if len(row)<expectedColNums[j]:
                 print('Finished successfully '
                       'but the output contains incorrect number of columns:')
-                print(fileName)
+                print(tsvFile)
                 print('The index of the worksheet:',j+1)
                 print('The expected number of columns:',expectedColNums[j])
                 print('The obtained number of columns:',len(row))
@@ -60,7 +92,7 @@ def checkExcelFile(fileName,
                  row.index('')!=emptyCells[i])):
                 print('Finished successfully '
                       'but the output contains empty cells!')
-                print(fileName)
+                print(tsvFile)
                 print('The index of the worksheet:',j+1)
                 print('The index of row:',i+1)
                 print('The index of cell:',row.index('')+1)
@@ -72,7 +104,7 @@ def checkExcelFile(fileName,
                 badPrimers==row[0]):
                 print('Finished successfully '
                       'but the output contains primers that should have been filtered out!')
-                print(fileName)
+                print(tsvFile)
                 print('The index of the worksheet:',j+1)
                 print('The index of row:',i+1)
                 print('Primers that should have been filtered out due to '+badFilter+':',badPrimers)
@@ -178,21 +210,21 @@ for c in iter(process.stdout.readline,''):
 if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_test_primers_combination_1_info.xls']),
+                                        'test_gene.regions_test_primers_combination_1_info.tsv']),
                    [3],[18])
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_all_draft_primers.xls']),
+                                        'test_gene.regions_all_draft_primers_draft_internal.tsv']),
                    [[30,40]],[10])
     if args.wholeGenomeRef:
         # Checking file with draft primers after blast
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[30,40]],[10])
     if args.dbSnpVcfFile:
         # Checking file with draft primers after SNPs
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[30,40]],[10])
     print('Finished successfully!')
 else:
@@ -203,7 +235,7 @@ else:
 print('\n# 3. Testing converting to draft-primers... #')
 cmd=['python3',thisDir+'convertToDraftFile.py',
      '-in',thisDir+os.sep.join(['test',
-                                'test_gene.regions_test_primers_combination_1_info.xls']),
+                                'test_gene.regions_test_primers_combination_1_info.tsv']),
      '-out',thisDir+os.sep.join(['test',
                                  'test_gene.regions_test_primers_combination_1_info.draft.xls'])]
 process=sp.Popen(cmd,shell=False,
@@ -255,23 +287,23 @@ for c in iter(process.stdout.readline,''):
 if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_test_primers_combination_1_info.xls']),
+                                        'test_gene.regions_test_primers_combination_1_info.tsv']),
                    [3],[18])
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_all_draft_primers.xls']),
+                                        'test_gene.regions_all_draft_primers_draft_internal.tsv']),
                    [35],[10])
     if args.wholeGenomeRef:
         # Checking file with draft primers after blast
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[34,35]],[10],
                        badPrimers='CCTCTCCCTCCCTCCAG_TGTGTTCCCGGACATAGTC',
                        badFilter='non-target hybridizations')
     if args.dbSnpVcfFile:
         # Checking file with draft primers after SNPs
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[33,35]],[10],
                        badPrimers='CTCACCTCCACCGTGCAG_CCCGTATCTCCCTTCCCTGATTA',
                        badFilter='overlapping SNPs')
@@ -310,21 +342,21 @@ for c in iter(process.stdout.readline,''):
 if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_test_primers_combination_1_info.xls']),
+                                        'test_gene.regions_test_primers_combination_1_info.tsv']),
                    [3,3],[18,18],2)
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_all_draft_primers.xls']),
+                                        'test_gene.regions_all_draft_primers_draft_internal.tsv']),
                    [[9,13],[9,13]],[10,10],2)
     if args.wholeGenomeRef:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[9,13],[9,13]],[10,10],2)
     if args.dbSnpVcfFile:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[9,13],[9,13]],[10,10],2)
     print('Finished successfully!')
 else:
@@ -345,7 +377,7 @@ cmd=['python3',thisDir+'NGS_primerplex.py',
      '-primernum1','3',
      '-embedded',
      '-draft',thisDir+os.sep.join(['test',
-                                   'test_gene.regions_all_draft_primers.xls'])]
+                                   'test_gene.regions_all_draft_primers_draft_internal.tsv'])]
 if args.wholeGenomeRef:
     cmd.extend(['-ref',args.wholeGenomeRef])
 else:
@@ -363,21 +395,21 @@ for c in iter(process.stdout.readline,''):
 if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_test_primers_combination_1_info.xls']),
+                                        'test_gene.regions_test_primers_combination_1_info.tsv']),
                    [3,3],[18,18],2)
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_all_draft_primers.xls']),
+                                        'test_gene.regions_all_draft_primers_draft_internal.tsv']),
                    [[9,13],[9,19]],[10,10],2)
     if args.wholeGenomeRef:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[9,13],[9,19]],[10,10],2)
     if args.dbSnpVcfFile:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[9,13],[9,19]],[10,10],2)
     print('Finished successfully!')
 else:
@@ -398,7 +430,7 @@ cmd=['python3',thisDir+'NGS_primerplex.py',
      '-primernum1','3',
      '-embedded',
      '-primers',thisDir+os.sep.join(['test',
-                                     'test_gene.regions_test_primers_combination_1_info.xls'])]
+                                     'test_gene.regions_test_primers_combination_1_info.tsv'])]
 if args.wholeGenomeRef:
     cmd.extend(['-ref',args.wholeGenomeRef])
 else:
@@ -417,21 +449,21 @@ if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     print(''.join(out))
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_test_primers_combination_1_info.xls']),
+                                        'test_gene.regions_test_primers_combination_1_info.tsv']),
                    [3,3],[18,18],2)
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_all_draft_primers.xls']),
+                                        'test_gene.regions_all_draft_primers_draft_internal.tsv']),
                    [[9,13],[9,13]],[10,10],2)
     if args.wholeGenomeRef:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[9,13],[9,13]],[10,10],2)
     if args.dbSnpVcfFile:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[9,13],[9,13]],[10,10],2)
     print('Finished successfully!')
 else:
@@ -469,21 +501,21 @@ if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     print(''.join(out))
     # Checking the main output file
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_anchored_test_anchored_primers_combination_1_info.xls']),
+                                        'test_gene.regions_anchored_test_anchored_primers_combination_1_info.tsv']),
                    [3,3],[18,18],2,[0,1,2])
     # Checking file with draft primers
     checkExcelFile(thisDir+os.sep.join(['test',
-                                        'test_gene.regions_anchored_all_draft_primers.xls']),
+                                        'test_gene.regions_anchored_all_draft_primers_draft_internal.tsv']),
                    [[6,18],[6,18]],[10,10],2)
     if args.wholeGenomeRef:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_anchored_all_draft_primers_after_specificity.xls']),
+                                            'test_gene.regions_anchored_all_draft_primers_after_specificity_draft_internal.tsv']),
                        [[6,18],[6,18]],[10,10],2)
     if args.dbSnpVcfFile:
         # Checking file with draft primers
         checkExcelFile(thisDir+os.sep.join(['test',
-                                            'test_gene.regions_anchored_all_draft_primers_after_SNPs.xls']),
+                                            'test_gene.regions_anchored_all_draft_primers_after_SNPs_draft_internal.tsv']),
                        [[6,18],[6,18]],[10,10],2)
     print('Finished successfully!')
 else:
@@ -521,7 +553,7 @@ if 'NGS-PrimerPlex finished!' in '\n'.join(out):
     print(''.join(out))
     # Checking output
     wb=xlrd.open_workbook(thisDir+os.sep.join(['test',
-                                               'DRB1.regions_test_skipping_primers_combination_1_info.xls']))
+                                               'DRB1.regions_test_skipping_primers_combination_1_info.tsv']))
     ws=wb.sheet_by_index(0)
     if ws.nrows<2:
         print('Finished successfully '
@@ -615,7 +647,7 @@ else:
 print('\n# 10. Testing addition of adapter sequences... #')
 cmd=['python3',thisDir+'addSeqToPrimers.py',
      '-in',thisDir+os.sep.join(['test',
-                                'test_gene.regions_test_primers_combination_1_info.xls'])]
+                                'test_gene.regions_test_primers_combination_1_info.tsv'])]
 process=sp.Popen(cmd,shell=False,
                  stdout=sp.PIPE,stderr=sp.STDOUT,
                  universal_newlines=True)

@@ -611,7 +611,7 @@ class DesignPrimers(Screen):
         outputFileName=''.join([regionsFilePath[:-4],
                                 '_NGS_primerplex_',
                                 runName,
-                                '_primers_combination_1_info.xls'])
+                                '_primers_combination_1_info.tsv'])
         app.root.ids['add_adapters'].ids['filename_text_input_primers'].text=outputFileName
 
     def run_docker(self,image_name,cmd,mounts):

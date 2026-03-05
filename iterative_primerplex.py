@@ -29,101 +29,60 @@ import argparse
 import subprocess
 import sys
 import os
-import zipfile
-import xml.etree.ElementTree as ET
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
-def filter_multiplexed_primers(info_xls, output_xls):
+def filter_multiplexed_primers(info_tsv, output_tsv):
     """
-    Filter info XLS to keep only rows where Designed_Multiplex (column 18, 0-indexed 17) is not empty.
+    Filter info TSV to keep only rows where Designed_Multiplex (column 18, 0-indexed 17) is not empty.
     The filtered file can be used directly as draft input (readDraftPrimers reads info format).
     Returns (kept_count, total_count).
     """
-    import shutil
-    from lxml import etree
-
-    # Read shared strings and identify rows to keep
-    rows_to_keep = set()
+    kept_rows = []
+    header = None
     total_data_rows = 0
-    with zipfile.ZipFile(info_xls) as z:
-        with z.open('xl/sharedStrings.xml') as f:
-            tree = ET.parse(f)
-            ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
-            shared_strings = [t.text if t.text else '' for t in tree.findall(f'.//{ns}t')]
 
-        with z.open('xl/worksheets/sheet1.xml') as f:
-            tree = ET.parse(f)
-            ns = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
-            rows = tree.findall(f'.//{ns}row')
+    # Find the actual TSV file - could be single-sheet or multi-sheet naming
+    actual_file = info_tsv
+    if not os.path.exists(actual_file):
+        # Try multi-sheet naming: base_ngs_primerplex_internal_primers.tsv
+        base = info_tsv
+        for ext in ('.tsv', '.xls'):
+            if base.endswith(ext):
+                base = base[:-len(ext)]
+                break
+        alt = base + '_ngs_primerplex_internal_primers.tsv'
+        if os.path.exists(alt):
+            actual_file = alt
+        else:
+            print(f'  WARNING: File not found: {info_tsv}')
+            return 0, 0
 
-            for row in rows:
-                row_num = row.get('r')
-                if row_num == '1':  # Header
-                    rows_to_keep.add('1')
-                    continue
+    with open(actual_file) as f:
+        for i, line in enumerate(f):
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            cols = line.split('\t')
+            if i == 0:
+                header = line
+                continue
+            total_data_rows += 1
+            # Column 17 (0-indexed) = Designed_Multiplex
+            if len(cols) > 17 and cols[17].strip() not in ('', ' '):
+                kept_rows.append(line)
 
-                total_data_rows += 1
-                cells = row.findall(f'.//{ns}c')
-                # Build cell values indexed by column letter
-                cell_values = {}
-                for cell in cells:
-                    ref = cell.get('r', '')
-                    col_letter = ''.join(c for c in ref if c.isalpha())
-                    v = cell.find(f'{ns}v')
-                    if v is not None and v.text:
-                        if cell.get('t') == 's':
-                            idx = int(v.text)
-                            cell_values[col_letter] = shared_strings[idx] if idx < len(shared_strings) else v.text
-                        else:
-                            cell_values[col_letter] = v.text
-                    else:
-                        cell_values[col_letter] = ''
-
-                # Column R = Designed_Multiplex (18th column = 'R')
-                designed_mult = cell_values.get('R', '')
-                if designed_mult != '' and designed_mult != ' ':
-                    rows_to_keep.add(row_num)
-
-    if len(rows_to_keep) <= 1:  # Only header
-        print(f'  WARNING: No multiplexed primers found in {info_xls}')
+    if not kept_rows:
+        print(f'  WARNING: No multiplexed primers found in {actual_file}')
         return 0, total_data_rows
 
-    # Copy and filter
-    shutil.copy(info_xls, output_xls)
+    with open(output_tsv, 'w') as f:
+        f.write(header + '\n')
+        for row in kept_rows:
+            f.write(row + '\n')
 
-    with zipfile.ZipFile(output_xls, 'r') as zin:
-        files_to_copy = {name: zin.read(name) for name in zin.namelist()}
-
-    ns_map = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    sheet_xml = files_to_copy['xl/worksheets/sheet1.xml']
-    root = etree.fromstring(sheet_xml)
-    sheet_data = root.find('.//main:sheetData', ns_map)
-
-    for row in sheet_data.findall('main:row', ns_map):
-        row_num = row.get('r')
-        if row_num not in rows_to_keep:
-            sheet_data.remove(row)
-
-    # Renumber rows
-    new_row_num = 1
-    for row in sheet_data.findall('main:row', ns_map):
-        row.set('r', str(new_row_num))
-        for cell in row.findall('main:c', ns_map):
-            old_ref = cell.get('r')
-            col_letter = ''.join(c for c in old_ref if c.isalpha())
-            cell.set('r', f'{col_letter}{new_row_num}')
-        new_row_num += 1
-
-    files_to_copy['xl/worksheets/sheet1.xml'] = etree.tostring(root, xml_declaration=True, encoding='UTF-8')
-
-    with zipfile.ZipFile(output_xls, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for name, content in files_to_copy.items():
-            zout.writestr(name, content)
-
-    kept = len(rows_to_keep) - 1  # Exclude header
-    return kept, total_data_rows
+    return len(kept_rows), total_data_rows
 
 
 def count_regions_by_priority(regions_file):
@@ -170,13 +129,19 @@ def create_priority_subset(regions_file, output_file, max_priority):
 def _find_intermediate_draft(input_base):
     """Find the best intermediate draft file produced by NGS_primerplex.py.
     These files are named based on the input regions file (not --run-name):
-      *_all_draft_primers_after_specificity.xls  (best - passed specificity)
-      *_all_draft_primers_after_SNPs.xls         (passed SNP check)
-      *_all_draft_primers_after_joinment.xls     (after block joining)
-      *_all_draft_primers.xls                    (all candidates from primer3)
+      *_all_draft_primers_after_specificity_draft_internal.tsv  (best - passed specificity)
+      *_all_draft_primers_after_SNPs_draft_internal.tsv         (passed SNP check)
+      *_all_draft_primers_after_joinment_draft_internal.tsv     (after block joining)
+      *_all_draft_primers_draft_internal.tsv                    (all candidates from primer3)
+    Also checks legacy .xls names for backwards compatibility.
     Returns the path to the best available file, or None.
     """
     candidates = [
+        f'{input_base}_all_draft_primers_after_specificity_draft_internal.tsv',
+        f'{input_base}_all_draft_primers_after_SNPs_draft_internal.tsv',
+        f'{input_base}_all_draft_primers_after_joinment_draft_internal.tsv',
+        f'{input_base}_all_draft_primers_draft_internal.tsv',
+        # Legacy .xls names
         f'{input_base}_all_draft_primers_after_specificity.xls',
         f'{input_base}_all_draft_primers_after_SNPs.xls',
         f'{input_base}_all_draft_primers_after_joinment.xls',
@@ -286,10 +251,20 @@ def main():
                 if rc != 0:
                     print(f'WARNING: Iteration exited with code {rc}')
 
-                # Find output info file
-                info_file = f'{input_base}_{run_name}_primers_combination_1_info.xls'
-                if not os.path.exists(info_file):
-                    print(f'WARNING: Expected output not found: {info_file}')
+                # Find output info file (try TSV multi-sheet naming, then single, then legacy .xls)
+                info_base = f'{input_base}_{run_name}_primers_combination_1_info'
+                info_file = None
+                for candidate in [
+                    f'{info_base}_ngs_primerplex_internal_primers.tsv',
+                    f'{info_base}.tsv',
+                    f'{info_base}.xls',
+                ]:
+                    if os.path.exists(candidate):
+                        info_file = candidate
+                        break
+
+                if info_file is None:
+                    print(f'WARNING: Expected output not found: {info_base}.*')
                     # Use intermediate draft files as fallback (best available)
                     intermediate_draft = _find_intermediate_draft(input_base)
                     if intermediate_draft and intermediate_draft != draft_file:
@@ -301,7 +276,7 @@ def main():
                 final_info_file = info_file
 
                 # Filter to multiplexed primers and use as draft for next iteration
-                new_draft = f'{input_base}_{run_name}_draft.xls'
+                new_draft = f'{input_base}_{run_name}_draft.tsv'
                 kept, total = filter_multiplexed_primers(info_file, new_draft)
 
                 print(f'\n  Iteration result: {kept}/{total} amplicons placed in multiplex')
@@ -332,9 +307,19 @@ def main():
             if rc != 0:
                 print(f'WARNING: Iteration exited with code {rc}')
 
-            info_file = f'{input_base}_{run_name}_primers_combination_1_info.xls'
-            if not os.path.exists(info_file):
-                print(f'WARNING: Expected output not found: {info_file}')
+            info_base = f'{input_base}_{run_name}_primers_combination_1_info'
+            info_file = None
+            for candidate in [
+                f'{info_base}_ngs_primerplex_internal_primers.tsv',
+                f'{info_base}.tsv',
+                f'{info_base}.xls',
+            ]:
+                if os.path.exists(candidate):
+                    info_file = candidate
+                    break
+
+            if info_file is None:
+                print(f'WARNING: Expected output not found: {info_base}.*')
                 intermediate_draft = _find_intermediate_draft(input_base)
                 if intermediate_draft and intermediate_draft != draft_file:
                     draft_file = intermediate_draft
@@ -343,7 +328,7 @@ def main():
 
             final_info_file = info_file
 
-            new_draft = f'{input_base}_{run_name}_draft.xls'
+            new_draft = f'{input_base}_{run_name}_draft.tsv'
             kept, total = filter_multiplexed_primers(info_file, new_draft)
 
             print(f'\n  Iteration result: {kept}/{total} amplicons placed in multiplex')
